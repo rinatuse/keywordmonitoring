@@ -3,6 +3,7 @@ const { StringSession } = require('telegram/sessions');
 const { Telegraf, Markup } = require('telegraf');
 const fs = require('fs');
 const input = require('input');
+const mongoose = require('mongoose');
 
 // Конфигурация
 const API_ID = 23305163;
@@ -12,10 +13,36 @@ const TARGET_GROUP = '-1002455984825';
 
 // Пути к файлам
 const SESSION_FILE = 'session.json';
-const LAST_MESSAGES_FILE = 'last_messages.json';
-const CONFIG_FILE = 'config.json';
 
-// Загрузка конфигурации
+// Настройка подключения к MongoDB
+mongoose.connect('mongodb://localhost:27017/telegram_monitor', {
+    useNewUrlParser: true,
+    useUnifiedTopology: true
+}).then(() => {
+    console.log('Успешное подключение к MongoDB');
+}).catch((error) => {
+    console.error('Ошибка подключения к MongoDB:', error);
+    process.exit(1);
+});
+
+// Определение схем MongoDB
+const ConfigSchema = new mongoose.Schema({
+    monitoredGroups: [String],
+    keywords: [String],
+    commentKeywords: [String],
+    checkInterval: { type: Number, default: 5 }
+});
+
+const LastMessageSchema = new mongoose.Schema({
+    groupId: { type: String, required: true, unique: true },
+    lastMessageId: { type: Number, default: 0 }
+});
+
+// Создание моделей
+const Config = mongoose.model('Config', ConfigSchema);
+const LastMessage = mongoose.model('LastMessage', LastMessageSchema);
+
+// Переменные для хранения данных
 let config = {
     monitoredGroups: [],
     keywords: [],
@@ -23,30 +50,9 @@ let config = {
     checkInterval: 5 // минуты
 };
 
-// Загрузка конфигурации, если файл существует
-if (fs.existsSync(CONFIG_FILE)) {
-    try {
-        config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
-        console.log('Конфигурация загружена:', config);
-
-        // Проверяем наличие поля commentKeywords, если его нет, добавляем
-        if (!config.commentKeywords) {
-            config.commentKeywords = [];
-            saveConfig();
-        }
-    } catch (error) {
-        console.error('Ошибка при загрузке конфигурации:', error);
-    }
-} else {
-    // Если файла нет, создаём конфигурацию по умолчанию
-    config.monitoredGroups = ['@tproger', 'https://t.me/multievan'];
-    config.keywords = ['javascript', 'node\\.js', 'telegram bot', 'США'];
-    config.commentKeywords = ['интересно', 'спасибо', 'помогите']; // Примеры ключевых слов для комментариев
-
-    // Сохраняем конфигурацию
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
-    console.log('Создана конфигурация по умолчанию');
-}
+// Переменная для контроля состояния мониторинга
+let isMonitoringActive = false;
+let monitoringInterval = null;
 
 // Загрузка сессии, если она существует
 let stringSession = new StringSession('');
@@ -54,22 +60,6 @@ if (fs.existsSync(SESSION_FILE)) {
     const sessionData = fs.readFileSync(SESSION_FILE, 'utf-8');
     stringSession = new StringSession(sessionData);
 }
-
-// Загрузка ID последних сообщений
-let lastMessageIds = {};
-try {
-    lastMessageIds = JSON.parse(fs.readFileSync(LAST_MESSAGES_FILE, 'utf-8'));
-} catch (error) {
-    // Если файла нет, создаем пустой объект
-    lastMessageIds = {};
-    config.monitoredGroups.forEach(group => {
-        lastMessageIds[group] = 0;
-    });
-}
-
-// Переменная для контроля состояния мониторинга
-let isMonitoringActive = false;
-let monitoringInterval = null;
 
 // Создаем клиент Telegram
 const client = new TelegramClient(
@@ -94,14 +84,58 @@ function getChannelNameFromLink(groupLink) {
     return groupLink;
 }
 
+// Функция для загрузки конфигурации из MongoDB
+async function loadConfig() {
+    try {
+        let configData = await Config.findOne();
+
+        if (!configData) {
+            // Создаем конфигурацию по умолчанию
+            configData = new Config({
+                monitoredGroups: ['@tproger', 'https://t.me/multievan'],
+                keywords: ['javascript', 'node\\.js', 'telegram bot', 'США'],
+                commentKeywords: ['интересно', 'спасибо', 'помогите'],
+                checkInterval: 5
+            });
+            await configData.save();
+            console.log('Создана конфигурация по умолчанию');
+        }
+
+        // Обновляем глобальную переменную
+        config = configData.toObject();
+        console.log('Конфигурация загружена:', config);
+        return config;
+    } catch (error) {
+        console.error('Ошибка при загрузке конфигурации:', error);
+        return null;
+    }
+}
+
 // Функция для сохранения конфигурации
-function saveConfig() {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
-    console.log('Конфигурация сохранена');
+async function saveConfig() {
+    try {
+        let configData = await Config.findOne();
+
+        if (!configData) {
+            configData = new Config(config);
+        } else {
+            configData.monitoredGroups = config.monitoredGroups;
+            configData.keywords = config.keywords;
+            configData.commentKeywords = config.commentKeywords;
+            configData.checkInterval = config.checkInterval;
+        }
+
+        await configData.save();
+        console.log('Конфигурация сохранена');
+        return true;
+    } catch (error) {
+        console.error('Ошибка при сохранении конфигурации:', error);
+        return false;
+    }
 }
 
 // Функция для проверки новых сообщений
-// Модификация функции checkNewMessages для проверки комментариев
+// Функция для проверки новых сообщений
 async function checkNewMessages() {
     if (!isMonitoringActive) {
         console.log('Мониторинг остановлен, пропускаем проверку');
@@ -127,16 +161,30 @@ async function checkNewMessages() {
 
             console.log(`Получено ${messages.length} сообщений из ${group}`);
 
+            // Получаем ID последнего проверенного сообщения из базы данных
+            let lastMessageData = await LastMessage.findOne({ groupId: group });
+
+            if (!lastMessageData) {
+                lastMessageData = new LastMessage({ groupId: group, lastMessageId: 0 });
+                await lastMessageData.save();
+            }
+
+            const lastMessageId = lastMessageData.lastMessageId;
+
             // Перебираем сообщения в обратном порядке (от старых к новым)
             for (const message of [...messages].reverse()) {
                 // Пропускаем уже проверенные сообщения
-                if (message.id <= (lastMessageIds[group] || 0)) {
-                    console.log(`Пропускаем сообщение [ID: ${message.id}], т.к. оно уже было проверено (последний ID: ${lastMessageIds[group] || 0})`);
+                if (message.id <= lastMessageId) {
+                    console.log(`Пропускаем сообщение [ID: ${message.id}], т.к. оно уже было проверено (последний ID: ${lastMessageId})`);
                     continue;
                 }
 
-                // Обновляем ID последнего проверенного сообщения
-                lastMessageIds[group] = message.id;
+                // Обновляем ID последнего проверенного сообщения в базе данных
+                await LastMessage.findOneAndUpdate(
+                    { groupId: group },
+                    { lastMessageId: message.id },
+                    { upsert: true }
+                );
 
                 // Если сообщение содержит текст, проверяем ключевые слова
                 if (message.message) {
@@ -187,51 +235,60 @@ async function checkNewMessages() {
                         console.log(`Проверяем комментарии к сообщению [ID: ${message.id}]...`);
 
                         try {
-                            // Получаем комментарии к посту
-                            const comments = await client.getMessages(entity, {
-                                replyTo: message.id,
-                                limit: 100 // Ограничиваем количество проверяемых комментариев
-                            });
+                            // Проверяем, поддерживает ли сообщение комментарии
+                            if (message.replies) {
+                                // Получаем комментарии к посту
+                                const comments = await client.getMessages(entity, {
+                                    replyTo: message.id,
+                                    limit: 100 // Ограничиваем количество проверяемых комментариев
+                                });
 
-                            console.log(`Получено ${comments.length} комментариев к сообщению [ID: ${message.id}]`);
+                                console.log(`Получено ${comments.length} комментариев к сообщению [ID: ${message.id}]`);
 
-                            // Проверяем каждый комментарий на наличие ключевых слов для комментариев
-                            for (const comment of comments) {
-                                if (comment.message) {
-                                    console.log(`Проверяем комментарий [ID: ${comment.id}] на ключевые слова для комментариев...`);
+                                // Проверяем каждый комментарий на наличие ключевых слов для комментариев
+                                for (const comment of comments) {
+                                    if (comment.message) {
+                                        console.log(`Проверяем комментарий [ID: ${comment.id}] на ключевые слова для комментариев...`);
 
-                                    for (const commentKeyword of config.commentKeywords) {
-                                        const commentRegex = new RegExp(commentKeyword, 'i');
+                                        for (const commentKeyword of config.commentKeywords) {
+                                            const commentRegex = new RegExp(commentKeyword, 'i');
 
-                                        if (commentRegex.test(comment.message)) {
-                                            console.log(`Найдено ключевое слово '${commentKeyword}' в комментарии [ID: ${comment.id}]`);
+                                            if (commentRegex.test(comment.message)) {
+                                                console.log(`Найдено ключевое слово '${commentKeyword}' в комментарии [ID: ${comment.id}]`);
 
-                                            // Формируем ссылку на сообщение и комментарий
-                                            const groupName = getChannelNameFromLink(group);
-                                            const messageLink = `https://t.me/${groupName}/${message.id}?comment=${comment.id}`;
+                                                // Формируем ссылку на сообщение и комментарий
+                                                const groupName = getChannelNameFromLink(group);
+                                                const messageLink = `https://t.me/${groupName}/${message.id}?comment=${comment.id}`;
 
-                                            // Ограничиваем длину комментария
-                                            const maxCommentLength = 1000;
-                                            let commentText = comment.message;
+                                                // Ограничиваем длину комментария
+                                                const maxCommentLength = 1000;
+                                                let commentText = comment.message;
 
-                                            if (commentText.length > maxCommentLength - 100) {
-                                                commentText = commentText.substring(0, maxCommentLength - 150) + '...\n[Комментарий слишком длинный и был обрезан]';
+                                                if (commentText.length > maxCommentLength - 100) {
+                                                    commentText = commentText.substring(0, maxCommentLength - 150) + '...\n[Комментарий слишком длинный и был обрезан]';
+                                                }
+
+                                                // Отправляем уведомление о найденном ключевом слове в комментарии
+                                                await bot.telegram.sendMessage(
+                                                    TARGET_GROUP,
+                                                    `🔍 Найдено ключевое слово '${foundKeyword}' в посте и '${commentKeyword}' в комментарии в группе ${group}:\n\n` +
+                                                    `Комментарий: ${commentText}\n\n` +
+                                                    `🔗 Ссылка: ${messageLink}`
+                                                );
+                                                break; // Переходим к следующему комментарию после нахождения первого ключевого слова
                                             }
-
-                                            // Отправляем уведомление о найденном ключевом слове в комментарии
-                                            await bot.telegram.sendMessage(
-                                                TARGET_GROUP,
-                                                `🔍 Найдено ключевое слово '${foundKeyword}' в посте и '${commentKeyword}' в комментарии в группе ${group}:\n\n` +
-                                                `Комментарий: ${commentText}\n\n` +
-                                                `🔗 Ссылка: ${messageLink}`
-                                            );
-                                            break; // Переходим к следующему комментарию после нахождения первого ключевого слова
                                         }
                                     }
                                 }
+                            } else {
+                                console.log(`Сообщение [ID: ${message.id}] не поддерживает комментарии или комментарии отключены`);
                             }
                         } catch (error) {
-                            console.error(`Ошибка при проверке комментариев к сообщению [ID: ${message.id}]:`, error);
+                            if (error.errorMessage === 'MSG_ID_INVALID') {
+                                console.log(`Не удалось получить комментарии к сообщению [ID: ${message.id}]: сообщение не найдено или нет доступа к комментариям`);
+                            } else {
+                                console.error(`Ошибка при проверке комментариев к сообщению [ID: ${message.id}]:`, error);
+                            }
                         }
                     }
                 }
@@ -241,8 +298,6 @@ async function checkNewMessages() {
         }
     }
 
-    // Сохраняем обновленные ID последних сообщений
-    fs.writeFileSync(LAST_MESSAGES_FILE, JSON.stringify(lastMessageIds));
     console.log('Проверка завершена.');
 }
 
@@ -296,6 +351,8 @@ function setUserState(userId, state) {
 function getUserState(userId) {
     return userStates[userId] || {};
 }
+
+// Клавиатуры меню
 const mainMenuKeyboard = Markup.keyboard([
     ['▶️ Управление', '📋 Группы'],
     ['🔍 Ключевые слова', '⚙️ Настройки'],
@@ -324,7 +381,6 @@ const keywordsMenuKeyboard = Markup.keyboard([
 
 const settingsMenuKeyboard = Markup.keyboard([
     ['⏱️ Установить интервал'],
-    // ['💾 Экспорт настроек', '📥 Импорт настроек'],
     ['🔙 Назад в главное меню']
 ]).resize();
 
@@ -387,7 +443,7 @@ bot.command('add_keyword', async (ctx) => {
 
     if (!config.keywords.includes(newKeyword)) {
         config.keywords.push(newKeyword);
-        saveConfig();
+        await saveConfig();
         ctx.reply(`✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга.`);
     } else {
         ctx.reply(`⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга.`);
@@ -395,7 +451,7 @@ bot.command('add_keyword', async (ctx) => {
 });
 
 // Команда для удаления ключевого слова
-bot.command('remove_keyword', (ctx) => {
+bot.command('remove_keyword', async (ctx) => {
     const args = ctx.message.text.split(' ');
     if (args.length < 2) {
         return ctx.reply('⚠️ Пожалуйста, укажите номер ключевого слова для удаления.\nПример: /remove_keyword 1');
@@ -409,7 +465,7 @@ bot.command('remove_keyword', (ctx) => {
 
     const removedKeyword = config.keywords[keywordIndex];
     config.keywords.splice(keywordIndex, 1);
-    saveConfig();
+    await saveConfig();
 
     ctx.reply(`✅ Ключевое слово '${removedKeyword}' удалено из списка мониторинга.`);
 });
@@ -439,9 +495,15 @@ bot.command('add_group', async (ctx) => {
 
     if (!config.monitoredGroups.includes(newGroup)) {
         config.monitoredGroups.push(newGroup);
-        lastMessageIds[newGroup] = 0;
-        fs.writeFileSync(LAST_MESSAGES_FILE, JSON.stringify(lastMessageIds));
-        saveConfig();
+        await saveConfig();
+
+        // Создаем запись для отслеживания последнего сообщения
+        await LastMessage.findOneAndUpdate(
+            { groupId: newGroup },
+            { lastMessageId: 0 },
+            { upsert: true }
+        );
+
         ctx.reply(`✅ Группа ${newGroup} добавлена в список мониторинга.`);
     } else {
         ctx.reply(`⚠️ Группа ${newGroup} уже есть в списке мониторинга.`);
@@ -449,7 +511,7 @@ bot.command('add_group', async (ctx) => {
 });
 
 // Команда для удаления группы из мониторинга
-bot.command('remove_group', (ctx) => {
+bot.command('remove_group', async (ctx) => {
     const args = ctx.message.text.split(' ');
     if (args.length < 2) {
         return ctx.reply('⚠️ Пожалуйста, укажите номер группы для удаления.\nПример: /remove_group 1');
@@ -463,7 +525,10 @@ bot.command('remove_group', (ctx) => {
 
     const removedGroup = config.monitoredGroups[groupIndex];
     config.monitoredGroups.splice(groupIndex, 1);
-    saveConfig();
+    await saveConfig();
+
+    // Удаляем запись о последнем сообщении
+    await LastMessage.deleteOne({ groupId: removedGroup });
 
     ctx.reply(`✅ Группа ${removedGroup} удалена из списка мониторинга.`);
 });
@@ -483,7 +548,7 @@ bot.command('list_groups', (ctx) => {
 });
 
 // Команда для установки интервала проверки
-bot.command('set_interval', (ctx) => {
+bot.command('set_interval', async (ctx) => {
     const args = ctx.message.text.split(' ');
     if (args.length < 2) {
         return ctx.reply('⚠️ Пожалуйста, укажите интервал в минутах.\nПример: /set_interval 10');
@@ -496,7 +561,7 @@ bot.command('set_interval', (ctx) => {
     }
 
     config.checkInterval = newInterval;
-    saveConfig();
+    await saveConfig();
 
     // Если мониторинг активен, перезапускаем с новым интервалом
     if (isMonitoringActive && monitoringInterval) {
@@ -547,7 +612,7 @@ bot.command('list_comment_keywords', (ctx) => {
     ctx.reply(message);
 });
 
-bot.command('add_comment_keyword', (ctx) => {
+bot.command('add_comment_keyword', async (ctx) => {
     const args = ctx.message.text.split(' ');
     if (args.length < 2) {
         return ctx.reply('⚠️ Пожалуйста, укажите ключевое слово для добавления в список комментариев.\nПример: /add_comment_keyword javascript');
@@ -557,14 +622,14 @@ bot.command('add_comment_keyword', (ctx) => {
 
     if (!config.commentKeywords.includes(newKeyword)) {
         config.commentKeywords.push(newKeyword);
-        saveConfig();
+        await saveConfig();
         ctx.reply(`✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга комментариев.`);
     } else {
         ctx.reply(`⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга комментариев.`);
     }
 });
 
-bot.command('remove_comment_keyword', (ctx) => {
+bot.command('remove_comment_keyword', async (ctx) => {
     const args = ctx.message.text.split(' ');
     if (args.length < 2) {
         return ctx.reply('⚠️ Пожалуйста, укажите номер ключевого слова для удаления из списка комментариев.\nПример: /remove_comment_keyword 1');
@@ -578,7 +643,7 @@ bot.command('remove_comment_keyword', (ctx) => {
 
     const removedKeyword = config.commentKeywords[keywordIndex];
     config.commentKeywords.splice(keywordIndex, 1);
-    saveConfig();
+    await saveConfig();
 
     ctx.reply(`✅ Ключевое слово '${removedKeyword}' удалено из списка мониторинга комментариев.`);
 });
@@ -611,7 +676,8 @@ bot.hears('📊 Статус', (ctx) => {
     let message = `📊 Статус мониторинга: ${status}\n`;
     message += `⏱️ Интервал проверки: ${config.checkInterval} минут\n`;
     message += `👁️ Групп в мониторинге: ${config.monitoredGroups.length}\n`;
-    message += `🔍 Ключевых слов: ${config.keywords.length}`;
+    message += `🔍 Ключевых слов: ${config.keywords.length}\n`;
+    message += `💬 Ключевых слов для комментариев: ${config.commentKeywords.length}`;
 
     const inlineKeyboard = isMonitoringActive
         ? Markup.inlineKeyboard([
@@ -664,7 +730,7 @@ bot.hears('🔄 Проверить сейчас', async (ctx) => {
 });
 
 // Обработка кнопок для работы с группами
-bot.hears('📋 Список групп', (ctx) => {
+bot.hears('📋 Список групп', async (ctx) => {
     ctx.replyWithChatAction('typing');
     if (config.monitoredGroups.length === 0) {
         return ctx.reply('📋 Список групп для мониторинга пуст.');
@@ -696,7 +762,7 @@ bot.hears('➕ Добавить группу', (ctx) => {
     );
 });
 
-bot.hears('➖ Удалить группу', (ctx) => {
+bot.hears('➖ Удалить группу', async (ctx) => {
     ctx.replyWithChatAction('typing');
     if (config.monitoredGroups.length === 0) {
         return ctx.reply('📋 Список групп для мониторинга пуст.');
@@ -787,42 +853,6 @@ bot.hears('⏱️ Установить интервал', (ctx) => {
     );
 });
 
-bot.hears('💾 Экспорт настроек', (ctx) => {
-    ctx.replyWithChatAction('typing');
-    // Создаем экспортируемую конфигурацию
-    const exportConfig = {
-        monitoredGroups: config.monitoredGroups,
-        keywords: config.keywords,
-        checkInterval: config.checkInterval
-    };
-
-    // Преобразуем в читаемый JSON с отступами
-    const configStr = JSON.stringify(exportConfig, null, 2);
-
-    // Создаем временный файл
-    const tempFilePath = './config_export.json';
-    fs.writeFileSync(tempFilePath, configStr);
-
-    // Отправляем файл
-    ctx.replyWithDocument({ source: tempFilePath, filename: 'monitor_bot_config.json' }, {
-        caption: '💾 Экспорт настроек бота мониторинга'
-    }).then(() => {
-        // Удаляем временный файл после отправки
-        fs.unlinkSync(tempFilePath);
-    });
-});
-
-bot.hears('📥 Импорт настроек', (ctx) => {
-    ctx.replyWithChatAction('typing');
-    ctx.reply(
-        '📥 Чтобы импортировать настройки, отправьте файл конфигурации в формате JSON.\n\n' +
-        'Файл должен содержать следующие поля:\n' +
-        '- monitoredGroups: массив групп для мониторинга\n' +
-        '- keywords: массив ключевых слов\n' +
-        '- checkInterval: интервал проверки в минутах'
-    );
-});
-
 // Обработчики для новых пунктов меню
 bot.hears('📝 Список ключевых слов комментариев', (ctx) => {
     ctx.replyWithChatAction('typing');
@@ -872,7 +902,6 @@ bot.hears('➖ Удалить ключевое слово комментарие
 
     ctx.reply(message, Markup.inlineKeyboard(buttons));
 });
-
 
 // Обработка нажатий на инлайн-кнопки
 bot.action('start_monitoring', async (ctx) => {
@@ -934,7 +963,10 @@ bot.action(groupRemovePattern, async (ctx) => {
 
     const removedGroup = config.monitoredGroups[groupIndex];
     config.monitoredGroups.splice(groupIndex, 1);
-    saveConfig();
+    await saveConfig();
+
+    // Удаляем запись о последнем сообщении
+    await LastMessage.deleteOne({ groupId: removedGroup });
 
     await ctx.answerCbQuery(`Группа ${removedGroup} удалена!`);
 
@@ -973,7 +1005,7 @@ bot.action(keywordRemovePattern, async (ctx) => {
 
     const removedKeyword = config.keywords[keywordIndex];
     config.keywords.splice(keywordIndex, 1);
-    saveConfig();
+    await saveConfig();
 
     await ctx.answerCbQuery(`Ключевое слово '${removedKeyword}' удалено!`);
 
@@ -1011,7 +1043,7 @@ bot.action(intervalPattern, async (ctx) => {
     }
 
     config.checkInterval = newInterval;
-    saveConfig();
+    await saveConfig();
 
     // Если мониторинг активен, перезапускаем с новым интервалом
     if (isMonitoringActive && monitoringInterval) {
@@ -1046,7 +1078,7 @@ bot.action(commentKeywordRemovePattern, async (ctx) => {
 
     const removedKeyword = config.commentKeywords[keywordIndex];
     config.commentKeywords.splice(keywordIndex, 1);
-    saveConfig();
+    await saveConfig();
 
     await ctx.answerCbQuery(`Ключевое слово '${removedKeyword}' удалено из списка комментариев!`);
 
@@ -1071,60 +1103,8 @@ bot.action(commentKeywordRemovePattern, async (ctx) => {
     }
 });
 
-
-// Обработка загрузки файла конфигурации
-bot.on('document', async (ctx) => {
-    const fileId = ctx.message.document.file_id;
-    const fileInfo = await ctx.telegram.getFile(fileId);
-    const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
-
-    // Загружаем файл
-    const fetch = require('node-fetch');
-    const response = await fetch(fileUrl);
-    const fileData = await response.text();
-
-    try {
-        // Парсим JSON
-        const importedConfig = JSON.parse(fileData);
-
-        // Проверяем наличие необходимых полей
-        if (!importedConfig.monitoredGroups || !importedConfig.keywords || !importedConfig.checkInterval) {
-            return ctx.reply('⚠️ Неверный формат файла конфигурации. Убедитесь, что файл содержит необходимые поля.');
-        }
-
-        // Применяем настройки
-        config.monitoredGroups = importedConfig.monitoredGroups;
-        config.keywords = importedConfig.keywords;
-        config.checkInterval = importedConfig.checkInterval;
-
-        // Сохраняем конфигурацию
-        saveConfig();
-
-        // Обновляем lastMessageIds для новых групп
-        config.monitoredGroups.forEach(group => {
-            if (!lastMessageIds[group]) {
-                lastMessageIds[group] = 0;
-            }
-        });
-        fs.writeFileSync(LAST_MESSAGES_FILE, JSON.stringify(lastMessageIds));
-
-        // Если мониторинг активен, перезапускаем с новым интервалом
-        if (isMonitoringActive && monitoringInterval) {
-            clearInterval(monitoringInterval);
-            monitoringInterval = setInterval(async () => {
-                await checkNewMessages().catch(console.error);
-            }, config.checkInterval * 60 * 1000);
-        }
-
-        ctx.reply('✅ Конфигурация успешно импортирована!');
-    } catch (error) {
-        console.error('Ошибка при импорте конфигурации:', error);
-        ctx.reply('⚠️ Ошибка при импорте конфигурации. Убедитесь, что файл содержит корректный JSON.');
-    }
-});
-
 // Обработка текстовых сообщений для добавления групп и ключевых слов
-bot.on('text', (ctx) => {
+bot.on('text', async (ctx) => {
     // Получаем текущее состояние пользователя
     const state = getUserState(ctx.from.id);
 
@@ -1134,9 +1114,13 @@ bot.on('text', (ctx) => {
 
         if (!config.monitoredGroups.includes(newGroup)) {
             config.monitoredGroups.push(newGroup);
-            lastMessageIds[newGroup] = 0;
-            fs.writeFileSync(LAST_MESSAGES_FILE, JSON.stringify(lastMessageIds));
-            saveConfig();
+            // Создаем запись для отслеживания последнего сообщения
+            await LastMessage.findOneAndUpdate(
+                { groupId: newGroup },
+                { lastMessageId: 0 },
+                { upsert: true }
+            );
+            await saveConfig();
             ctx.reply(`✅ Группа ${newGroup} добавлена в список мониторинга.`);
         } else {
             ctx.reply(`⚠️ Группа ${newGroup} уже есть в списке мониторинга.`);
@@ -1153,7 +1137,7 @@ bot.on('text', (ctx) => {
 
         if (!config.keywords.includes(newKeyword)) {
             config.keywords.push(newKeyword);
-            saveConfig();
+            await saveConfig();
             ctx.reply(`✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга.`);
         } else {
             ctx.reply(`⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга.`);
@@ -1170,7 +1154,7 @@ bot.on('text', (ctx) => {
 
         if (!config.commentKeywords.includes(newKeyword)) {
             config.commentKeywords.push(newKeyword);
-            saveConfig();
+            await saveConfig();
             ctx.reply(`✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга комментариев.`);
         } else {
             ctx.reply(`⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга комментариев.`);
@@ -1182,9 +1166,73 @@ bot.on('text', (ctx) => {
     }
 });
 
+// Миграция данных из JSON в MongoDB при первом запуске
+async function migrateFromJson() {
+    try {
+        // Проверяем, есть ли данные в MongoDB
+        const configExists = await Config.countDocuments();
+        const lastMessageExists = await LastMessage.countDocuments();
+
+        // Если данные уже есть в MongoDB, пропускаем миграцию
+        if (configExists > 0 || lastMessageExists > 0) {
+            console.log('Данные уже существуют в MongoDB, пропускаем миграцию');
+            return;
+        }
+
+        // Проверяем наличие JSON-файлов для миграции
+        if (!fs.existsSync('config.json') || !fs.existsSync('last_messages.json')) {
+            console.log('Файлы JSON для миграции не найдены');
+            return;
+        }
+
+        console.log('Начинаем миграцию данных из JSON в MongoDB...');
+
+        // Загружаем данные из JSON-файлов
+        const configData = JSON.parse(fs.readFileSync('config.json', 'utf-8'));
+        const lastMessagesData = JSON.parse(fs.readFileSync('last_messages.json', 'utf-8'));
+
+        // Сохраняем конфигурацию в MongoDB
+        const newConfig = new Config({
+            monitoredGroups: configData.monitoredGroups || [],
+            keywords: configData.keywords || [],
+            commentKeywords: configData.commentKeywords || [],
+            checkInterval: configData.checkInterval || 5
+        });
+        await newConfig.save();
+
+        // Сохраняем данные о последних сообщениях
+        for (const [groupId, lastMessageId] of Object.entries(lastMessagesData)) {
+            const newLastMessage = new LastMessage({
+                groupId,
+                lastMessageId
+            });
+            await newLastMessage.save();
+        }
+
+        console.log('Миграция данных из JSON в MongoDB успешно завершена');
+
+        // Создаем резервные копии JSON-файлов
+        fs.renameSync('config.json', 'config.json.bak');
+        fs.renameSync('last_messages.json', 'last_messages.json.bak');
+
+        console.log('Созданы резервные копии JSON-файлов');
+    } catch (error) {
+        console.error('Ошибка при миграции данных из JSON в MongoDB:', error);
+    }
+}
+
 // Главная функция для запуска приложения
 async function main() {
     console.log('Запуск приложения...');
+
+    // Выполняем миграцию данных из JSON в MongoDB при первом запуске
+    await migrateFromJson();
+
+    // Загружаем конфигурацию из базы данных
+    const configData = await loadConfig();
+    if (configData) {
+        config = configData;
+    }
 
     // Подключаемся к Telegram
     await client.start({
@@ -1206,17 +1254,11 @@ async function main() {
 
     // Отправляем сообщение, что бот запустился
     try {
-        const mainMenuKeyboardMarkup = Markup.keyboard([
-            ['▶️ Управление', '📋 Группы'],
-            ['🔍 Ключевые слова', '⚙️ Настройки'],
-            ['📊 Статус', '❓ Помощь']
-        ]).resize();
-
         await bot.telegram.sendMessage(
             TARGET_GROUP,
             '🤖 Бот мониторинга запущен и готов к работе!\n' +
             'Используйте команду /start для получения списка доступных команд.',
-            mainMenuKeyboardMarkup
+            mainMenuKeyboard
         );
     } catch (error) {
         console.error('Не удалось отправить стартовое сообщение:', error);
@@ -1231,11 +1273,14 @@ process.once('SIGINT', () => {
     stopMonitoring();
     bot.stop('SIGINT');
     client.disconnect();
+    mongoose.connection.close();
     console.log('Приложение остановлено!');
 });
+
 process.once('SIGTERM', () => {
     stopMonitoring();
     bot.stop('SIGTERM');
     client.disconnect();
+    mongoose.connection.close();
     console.log('Приложение завершено!');
 });
