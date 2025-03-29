@@ -8,5 +8,8 @@
     "Python",
     "GO"
   ],
-  "checkInterval": 30
+  "checkInterval": 30,
+  "commentKeywords": [
+    "javascript"
+  ]
 }

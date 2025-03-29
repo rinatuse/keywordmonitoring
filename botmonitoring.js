@@ -19,6 +19,7 @@ const CONFIG_FILE = 'config.json';
 let config = {
     monitoredGroups: [],
     keywords: [],
+    commentKeywords: [],
     checkInterval: 5 // минуты
 };
 
@@ -27,6 +28,12 @@ if (fs.existsSync(CONFIG_FILE)) {
     try {
         config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
         console.log('Конфигурация загружена:', config);
+
+        // Проверяем наличие поля commentKeywords, если его нет, добавляем
+        if (!config.commentKeywords) {
+            config.commentKeywords = [];
+            saveConfig();
+        }
     } catch (error) {
         console.error('Ошибка при загрузке конфигурации:', error);
     }
@@ -34,6 +41,7 @@ if (fs.existsSync(CONFIG_FILE)) {
     // Если файла нет, создаём конфигурацию по умолчанию
     config.monitoredGroups = ['@tproger', 'https://t.me/multievan'];
     config.keywords = ['javascript', 'node\\.js', 'telegram bot', 'США'];
+    config.commentKeywords = ['интересно', 'спасибо', 'помогите']; // Примеры ключевых слов для комментариев
 
     // Сохраняем конфигурацию
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
@@ -93,6 +101,7 @@ function saveConfig() {
 }
 
 // Функция для проверки новых сообщений
+// Модификация функции checkNewMessages для проверки комментариев
 async function checkNewMessages() {
     if (!isMonitoringActive) {
         console.log('Мониторинг остановлен, пропускаем проверку');
@@ -101,6 +110,7 @@ async function checkNewMessages() {
 
     console.log('Проверяем новые сообщения...');
     console.log('Текущие ключевые слова:', config.keywords);
+    console.log('Ключевые слова для комментариев:', config.commentKeywords);
 
     for (const group of config.monitoredGroups) {
         try {
@@ -133,6 +143,10 @@ async function checkNewMessages() {
                     console.log(`Проверяем сообщение [ID: ${message.id}] на ключевые слова...`);
                     console.log(`Первые 100 символов сообщения: ${message.message.substring(0, 100)}...`);
 
+                    let foundKeyword = null;
+                    let shouldCheckComments = false;
+
+                    // Проверяем основные ключевые слова
                     for (const keyword of config.keywords) {
                         // Создаем регулярное выражение из ключевого слова
                         const regex = new RegExp(keyword, 'i');
@@ -141,6 +155,8 @@ async function checkNewMessages() {
                         // Проверяем наличие ключевого слова в тексте
                         if (regex.test(message.message)) {
                             console.log(`Найдено ключевое слово '${keyword}' в группе ${group}`);
+                            foundKeyword = keyword;
+                            shouldCheckComments = true; // Отмечаем, что нужно проверить комментарии
 
                             // Формируем ссылку на сообщение
                             const groupName = getChannelNameFromLink(group);
@@ -162,6 +178,60 @@ async function checkNewMessages() {
                                 `🔗 Ссылка: ${messageLink}`
                             );
                             break;
+                        }
+                    }
+
+                    // Если найдено ключевое слово в посте и есть ключевые слова для комментариев,
+                    // проверяем комментарии к этому посту
+                    if (shouldCheckComments && config.commentKeywords.length > 0) {
+                        console.log(`Проверяем комментарии к сообщению [ID: ${message.id}]...`);
+
+                        try {
+                            // Получаем комментарии к посту
+                            const comments = await client.getMessages(entity, {
+                                replyTo: message.id,
+                                limit: 100 // Ограничиваем количество проверяемых комментариев
+                            });
+
+                            console.log(`Получено ${comments.length} комментариев к сообщению [ID: ${message.id}]`);
+
+                            // Проверяем каждый комментарий на наличие ключевых слов для комментариев
+                            for (const comment of comments) {
+                                if (comment.message) {
+                                    console.log(`Проверяем комментарий [ID: ${comment.id}] на ключевые слова для комментариев...`);
+
+                                    for (const commentKeyword of config.commentKeywords) {
+                                        const commentRegex = new RegExp(commentKeyword, 'i');
+
+                                        if (commentRegex.test(comment.message)) {
+                                            console.log(`Найдено ключевое слово '${commentKeyword}' в комментарии [ID: ${comment.id}]`);
+
+                                            // Формируем ссылку на сообщение и комментарий
+                                            const groupName = getChannelNameFromLink(group);
+                                            const messageLink = `https://t.me/${groupName}/${message.id}?comment=${comment.id}`;
+
+                                            // Ограничиваем длину комментария
+                                            const maxCommentLength = 1000;
+                                            let commentText = comment.message;
+
+                                            if (commentText.length > maxCommentLength - 100) {
+                                                commentText = commentText.substring(0, maxCommentLength - 150) + '...\n[Комментарий слишком длинный и был обрезан]';
+                                            }
+
+                                            // Отправляем уведомление о найденном ключевом слове в комментарии
+                                            await bot.telegram.sendMessage(
+                                                TARGET_GROUP,
+                                                `🔍 Найдено ключевое слово '${foundKeyword}' в посте и '${commentKeyword}' в комментарии в группе ${group}:\n\n` +
+                                                `Комментарий: ${commentText}\n\n` +
+                                                `🔗 Ссылка: ${messageLink}`
+                                            );
+                                            break; // Переходим к следующему комментарию после нахождения первого ключевого слова
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (error) {
+                            console.error(`Ошибка при проверке комментариев к сообщению [ID: ${message.id}]:`, error);
                         }
                     }
                 }
@@ -247,6 +317,8 @@ const groupsMenuKeyboard = Markup.keyboard([
 const keywordsMenuKeyboard = Markup.keyboard([
     ['📝 Список ключевых слов', '➕ Добавить ключевое слово'],
     ['➖ Удалить ключевое слово'],
+    ['📝 Список ключевых слов комментариев', '➕ Добавить ключевое слово комментариев'],
+    ['➖ Удалить ключевое слово комментариев'],
     ['🔙 Назад в главное меню']
 ]).resize();
 
@@ -444,7 +516,8 @@ bot.command('status', (ctx) => {
     let message = `📊 Статус мониторинга: ${status}\n`;
     message += `⏱️ Интервал проверки: ${config.checkInterval} минут\n`;
     message += `👁️ Групп в мониторинге: ${config.monitoredGroups.length}\n`;
-    message += `🔍 Ключевых слов: ${config.keywords.length}`;
+    message += `🔍 Ключевых слов: ${config.keywords.length}\n`;
+    message += `💬 Ключевых слов для комментариев: ${config.commentKeywords.length}`;
 
     // Создаем инлайн-клавиатуру с кнопками управления
     const inlineKeyboard = isMonitoringActive
@@ -458,6 +531,56 @@ bot.command('status', (ctx) => {
         ]);
 
     ctx.reply(message, inlineKeyboard);
+});
+
+// Команды для работы с ключевыми словами комментариев
+bot.command('list_comment_keywords', (ctx) => {
+    if (config.commentKeywords.length === 0) {
+        return ctx.reply('📝 Список ключевых слов для комментариев пуст.');
+    }
+
+    let message = '📝 Ключевые слова для комментариев:\n';
+    config.commentKeywords.forEach((keyword, index) => {
+        message += `${index + 1}. ${keyword}\n`;
+    });
+
+    ctx.reply(message);
+});
+
+bot.command('add_comment_keyword', (ctx) => {
+    const args = ctx.message.text.split(' ');
+    if (args.length < 2) {
+        return ctx.reply('⚠️ Пожалуйста, укажите ключевое слово для добавления в список комментариев.\nПример: /add_comment_keyword javascript');
+    }
+
+    const newKeyword = args.slice(1).join(' ');
+
+    if (!config.commentKeywords.includes(newKeyword)) {
+        config.commentKeywords.push(newKeyword);
+        saveConfig();
+        ctx.reply(`✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга комментариев.`);
+    } else {
+        ctx.reply(`⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга комментариев.`);
+    }
+});
+
+bot.command('remove_comment_keyword', (ctx) => {
+    const args = ctx.message.text.split(' ');
+    if (args.length < 2) {
+        return ctx.reply('⚠️ Пожалуйста, укажите номер ключевого слова для удаления из списка комментариев.\nПример: /remove_comment_keyword 1');
+    }
+
+    const keywordIndex = parseInt(args[1]) - 1;
+
+    if (isNaN(keywordIndex) || keywordIndex < 0 || keywordIndex >= config.commentKeywords.length) {
+        return ctx.reply(`⚠️ Некорректный номер. Введите число от 1 до ${config.commentKeywords.length}.`);
+    }
+
+    const removedKeyword = config.commentKeywords[keywordIndex];
+    config.commentKeywords.splice(keywordIndex, 1);
+    saveConfig();
+
+    ctx.reply(`✅ Ключевое слово '${removedKeyword}' удалено из списка мониторинга комментариев.`);
 });
 
 // Обработка нажатий на кнопки меню
@@ -700,6 +823,57 @@ bot.hears('📥 Импорт настроек', (ctx) => {
     );
 });
 
+// Обработчики для новых пунктов меню
+bot.hears('📝 Список ключевых слов комментариев', (ctx) => {
+    ctx.replyWithChatAction('typing');
+    if (config.commentKeywords.length === 0) {
+        return ctx.reply('📝 Список ключевых слов для комментариев пуст.');
+    }
+
+    let message = '📝 Ключевые слова для комментариев:\n';
+    const buttons = [];
+
+    config.commentKeywords.forEach((keyword, index) => {
+        message += `${index + 1}. ${keyword}\n`;
+        buttons.push([Markup.button.callback(`❌ Удалить ${index + 1}`, `remove_comment_keyword_${index}`)]);
+    });
+
+    const inlineKeyboard = Markup.inlineKeyboard([
+        ...buttons,
+        [Markup.button.callback('➕ Добавить новое слово', 'add_comment_keyword_dialog')]
+    ]);
+
+    ctx.reply(message, inlineKeyboard);
+});
+
+bot.hears('➕ Добавить ключевое слово комментариев', (ctx) => {
+    ctx.replyWithChatAction('typing');
+    ctx.reply(
+        '➕ Чтобы добавить ключевое слово для комментариев, отправьте команду в формате:\n' +
+        '/add_comment_keyword javascript\n\n' +
+        'Вы можете добавить несколько слов, разделив их запятыми:\n' +
+        '/add_comment_keyword javascript, python, telegram'
+    );
+});
+
+bot.hears('➖ Удалить ключевое слово комментариев', (ctx) => {
+    ctx.replyWithChatAction('typing');
+    if (config.commentKeywords.length === 0) {
+        return ctx.reply('📝 Список ключевых слов для комментариев пуст.');
+    }
+
+    let message = '➖ Выберите ключевое слово для удаления из списка комментариев:\n';
+    const buttons = [];
+
+    config.commentKeywords.forEach((keyword, index) => {
+        message += `${index + 1}. ${keyword}\n`;
+        buttons.push([Markup.button.callback(`❌ ${index + 1}. ${keyword}`, `remove_comment_keyword_${index}`)]);
+    });
+
+    ctx.reply(message, Markup.inlineKeyboard(buttons));
+});
+
+
 // Обработка нажатий на инлайн-кнопки
 bot.action('start_monitoring', async (ctx) => {
     await ctx.answerCbQuery('Запускаю мониторинг...');
@@ -851,6 +1025,53 @@ bot.action(intervalPattern, async (ctx) => {
     await ctx.editMessageText(`⏱️ Интервал проверки установлен на ${newInterval} минут.`);
 });
 
+// Обработчики для диалогов добавления ключевых слов комментариев
+bot.action('add_comment_keyword_dialog', async (ctx) => {
+    await ctx.answerCbQuery();
+    setUserState(ctx.from.id, { waitingForCommentKeyword: true });
+    await ctx.reply('Введите ключевое слово для добавления в список комментариев:');
+});
+
+// Обработчики для удаления ключевых слов комментариев
+const commentKeywordRemovePattern = /remove_comment_keyword_(\d+)/;
+bot.action(commentKeywordRemovePattern, async (ctx) => {
+    const match = ctx.callbackQuery.data.match(commentKeywordRemovePattern);
+    if (!match) return await ctx.answerCbQuery('Ошибка!');
+
+    const keywordIndex = parseInt(match[1]);
+
+    if (isNaN(keywordIndex) || keywordIndex < 0 || keywordIndex >= config.commentKeywords.length) {
+        return await ctx.answerCbQuery('Некорректный номер ключевого слова!');
+    }
+
+    const removedKeyword = config.commentKeywords[keywordIndex];
+    config.commentKeywords.splice(keywordIndex, 1);
+    saveConfig();
+
+    await ctx.answerCbQuery(`Ключевое слово '${removedKeyword}' удалено из списка комментариев!`);
+
+    // Обновляем сообщение
+    if (config.commentKeywords.length === 0) {
+        await ctx.editMessageText('📝 Список ключевых слов для комментариев пуст.');
+    } else {
+        let message = '📝 Ключевые слова для комментариев:\n';
+        const buttons = [];
+
+        config.commentKeywords.forEach((keyword, index) => {
+            message += `${index + 1}. ${keyword}\n`;
+            buttons.push([Markup.button.callback(`❌ Удалить ${index + 1}`, `remove_comment_keyword_${index}`)]);
+        });
+
+        const inlineKeyboard = Markup.inlineKeyboard([
+            ...buttons,
+            [Markup.button.callback('➕ Добавить новое слово', 'add_comment_keyword_dialog')]
+        ]);
+
+        await ctx.editMessageText(message, inlineKeyboard);
+    }
+});
+
+
 // Обработка загрузки файла конфигурации
 bot.on('document', async (ctx) => {
     const fileId = ctx.message.document.file_id;
@@ -936,6 +1157,23 @@ bot.on('text', (ctx) => {
             ctx.reply(`✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга.`);
         } else {
             ctx.reply(`⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга.`);
+        }
+
+        // Сбрасываем состояние ожидания
+        setUserState(ctx.from.id, {});
+        return;
+    }
+
+    // Проверяем, находимся ли мы в режиме ожидания ввода ключевого слова для комментариев
+    if (state.waitingForCommentKeyword) {
+        const newKeyword = ctx.message.text.trim();
+
+        if (!config.commentKeywords.includes(newKeyword)) {
+            config.commentKeywords.push(newKeyword);
+            saveConfig();
+            ctx.reply(`✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга комментариев.`);
+        } else {
+            ctx.reply(`⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга комментариев.`);
         }
 
         // Сбрасываем состояние ожидания
