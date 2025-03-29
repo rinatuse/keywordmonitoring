@@ -5,11 +5,14 @@ const fs = require('fs');
 const input = require('input');
 const mongoose = require('mongoose');
 
+
+
 // Конфигурация
 const API_ID = 23305163;
 const API_HASH = 'e39d80bf11e7f3464f4fdb54e0b6d71b';
 const BOT_TOKEN = '7560225297:AAGg7FyjX51Rlbye1-hbqtWGDLd_YN3BH6Y';
 const TARGET_GROUP = '-1002455984825';
+
 
 // Пути к файлам
 const SESSION_FILE = 'session.json';
@@ -75,7 +78,13 @@ const client = new TelegramClient(
     stringSession,
     API_ID,
     API_HASH,
-    { connectionRetries: 5 }
+    {
+        connectionRetries: 10,      // Увеличиваем количество повторных попыток
+        useWSS: true,              // Используем более стабильное WebSocket соединение
+        requestRetries: 5,          // Повторяем запросы при ошибках
+        timeout: 180000,            // Увеличиваем таймаут до 3 минут (180000 мс)
+        maxConcurrentDownloads: 3   // Ограничиваем количество параллельных загрузок
+    }
 );
 
 // Создаем бота для отправки уведомлений
@@ -91,6 +100,36 @@ function getChannelNameFromLink(groupLink) {
         return groupLink.substring(1);
     }
     return groupLink;
+}
+// Функция для безопасного выполнения запроса к Telegram API с защитой от таймаута
+async function safeApiRequest(requestFunction, fallbackValue = null, timeoutMs = 60000) {
+    return new Promise(async (resolve) => {
+        // Создаем таймер для ограничения времени выполнения запроса
+        const timeoutId = setTimeout(() => {
+            console.log(`Запрос к Telegram API прерван по таймауту (${timeoutMs}ms)`);
+            resolve(fallbackValue);
+        }, timeoutMs);
+
+        try {
+            // Выполняем запрос
+            const result = await requestFunction();
+            clearTimeout(timeoutId);
+            resolve(result);
+        } catch (error) {
+            console.error('Ошибка при выполнении запроса к Telegram API:', error);
+            clearTimeout(timeoutId);
+            resolve(fallbackValue);
+        }
+    });
+}
+
+// Модифицированная функция получения сообщений с защитой от таймаута
+async function getMessagesWithTimeout(entity, params, timeoutMs = 30000) {
+    return safeApiRequest(
+        async () => await client.getMessages(entity, params),
+        [], // Если произошел таймаут, возвращаем пустой массив
+        timeoutMs
+    );
 }
 
 // Функция для загрузки конфигурации из MongoDB
@@ -247,7 +286,139 @@ async function sendPendingMatches() {
     }
 }
 
+// Функция для проверки комментариев с ограничением по времени
+async function checkCommentsWithTimeout(message, group, entity) {
+    // Максимальное время на проверку комментариев (в мс)
+    const MAX_COMMENTS_CHECK_TIME = 15000; // 15 секунд
+
+    return new Promise((resolve) => {
+        // Устанавливаем таймаут для завершения проверки комментариев
+        const timeoutId = setTimeout(() => {
+            console.log(`Превышено время проверки комментариев к сообщению [ID: ${message.id}], прерываем проверку`);
+            resolve();
+        }, MAX_COMMENTS_CHECK_TIME);
+
+        // Запускаем проверку комментариев
+        (async () => {
+            try {
+                console.log(`Проверяем комментарии к сообщению [ID: ${message.id}]...`);
+                console.log(`Есть ли у сообщения replies:`, !!message.replies);
+
+                if (message.replies && message.replies.replies > 0) {
+                    // Получаем комментарии к посту с ограничением
+                    const comments = await client.getMessages(entity, {
+                        replyTo: message.id,
+                        limit: 20 // Уменьшаем количество проверяемых комментариев
+                    });
+
+                    // Задержка после получения комментариев
+                    await delay(1000);
+
+                    console.log(`Получено ${comments.length} комментариев к сообщению [ID: ${message.id}]`);
+
+                    // Проверяем каждый комментарий
+                    for (const comment of comments) {
+                        if (comment.message) {
+                            console.log(`Проверяем комментарий [ID: ${comment.id}] на ключевые слова для комментариев...`);
+
+                            for (const commentKeyword of config.commentKeywords) {
+                                const commentRegex = new RegExp(commentKeyword, 'i');
+
+                                if (commentRegex.test(comment.message)) {
+                                    console.log(`Найдено ключевое слово '${commentKeyword}' в комментарии [ID: ${comment.id}]`);
+
+                                    // Формируем ссылку на комментарий
+                                    const groupName = getChannelNameFromLink(group);
+                                    const commentLink = `https://t.me/${groupName}/${message.id}?comment=${comment.id}`;
+
+                                    // Ограничиваем длину комментария
+                                    const maxCommentLength = 1000;
+                                    let commentText = comment.message;
+
+                                    if (commentText.length > maxCommentLength - 100) {
+                                        commentText = commentText.substring(0, maxCommentLength - 150) + '...\n[Комментарий слишком длинный и был обрезан]';
+                                    }
+
+                                    // Добавляем в список ожидающих отправки комментариев
+                                    pendingMatches.comments.push({
+                                        group,
+                                        keyword: commentKeyword,
+                                        commentText,
+                                        commentLink,
+                                        messageId: message.id,
+                                        commentId: comment.id
+                                    });
+
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    console.log(`Сообщение [ID: ${message.id}] не поддерживает комментарии или комментарии отключены`);
+                }
+            } catch (error) {
+                console.error(`Ошибка при проверке комментариев к сообщению [ID: ${message.id}]:`, error);
+            } finally {
+                // Очищаем таймаут и завершаем проверку
+                clearTimeout(timeoutId);
+                resolve();
+            }
+        })();
+    });
+}
+
+// Функция для проверки сообщения на ключевые слова
+async function checkMessageForKeywords(message, group, entity) {
+    try {
+        console.log(`Первые 100 символов сообщения: ${message.message.substring(0, 100)}...`);
+
+        // Проверяем основные ключевые слова
+        for (const keyword of config.keywords) {
+            // Создаем регулярное выражение из ключевого слова
+            const regex = new RegExp(keyword, 'i');
+            console.log(`Проверяем ключевое слово: '${keyword}'`);
+
+            // Проверяем наличие ключевого слова в тексте
+            if (regex.test(message.message)) {
+                console.log(`Найдено ключевое слово '${keyword}' в группе ${group}`);
+
+                // Формируем ссылку на сообщение
+                const groupName = getChannelNameFromLink(group);
+                const messageLink = `https://t.me/${groupName}/${message.id}`;
+
+                // Ограничиваем длину сообщения
+                const maxMessageLength = 3000;
+                let messageText = message.message;
+
+                if (messageText.length > maxMessageLength - 200) {
+                    messageText = messageText.substring(0, maxMessageLength - 250) + '...\n[Сообщение слишком длинное и было обрезано]';
+                }
+
+                // Добавляем в список ожидающих отправки совпадений
+                pendingMatches.keywords.push({
+                    group,
+                    keyword,
+                    messageText,
+                    messageLink
+                });
+
+                break;
+            }
+        }
+
+        // Проверяем комментарии только если есть ключевые слова для комментариев
+        if (config.commentKeywords.length > 0) {
+            // Проверяем наличие комментариев с ограничением по времени
+            await checkCommentsWithTimeout(message, group, entity);
+        }
+    } catch (error) {
+        console.error(`Ошибка при проверке сообщения [ID: ${message.id}]:`, error);
+    }
+}
+
 // Функция для проверки новых сообщений
+
 async function checkNewMessages() {
     if (!isMonitoringActive) {
         console.log('Мониторинг остановлен, пропускаем проверку');
@@ -255,9 +426,6 @@ async function checkNewMessages() {
     }
 
     console.log('Начинаем проверку...');
-    console.log('Количество ключевых слов для комментариев:', config.commentKeywords.length);
-    console.log('Ключевые слова для комментариев:', config.commentKeywords);
-    console.log('Текущие ключевые слова:', config.keywords);
 
     try {
         // Очищаем накопленные совпадения
@@ -266,186 +434,30 @@ async function checkNewMessages() {
             comments: []
         };
 
+        // Проверяем каждую группу
         for (const group of config.monitoredGroups) {
             try {
-                console.log(`Проверяем группу ${group}...`);
-
-                // Получаем имя канала из ссылки, если это ссылка
-                const channelName = getChannelNameFromLink(group);
-
-                // Получаем сущность группы/канала
-                const entity = await client.getEntity(channelName);
-
-                // Получаем последние сообщения
-                const messages = await client.getMessages(entity, { limit: 20 });
-                await delay(1000); // Задержка после получения сообщений
-
-                console.log(`Получено ${messages.length} сообщений из ${group}`);
-
-                // Получаем ID последнего проверенного сообщения из базы данных
-                let lastMessageData = await LastMessage.findOne({ groupId: group });
-
-                if (!lastMessageData) {
-                    lastMessageData = new LastMessage({ groupId: group, lastMessageId: 0 });
-                    await lastMessageData.save();
-                }
-
-                const lastMessageId = lastMessageData.lastMessageId;
-
-                // Перебираем сообщения в обратном порядке (от старых к новым)
-                for (const message of [...messages].reverse()) {
-                    // Пропускаем уже проверенные сообщения
-                    if (message.id <= lastMessageId) {
-                        console.log(`Пропускаем сообщение [ID: ${message.id}], т.к. оно уже было проверено (последний ID: ${lastMessageId})`);
-                        continue;
-                    }
-
-                    // Обновляем ID последнего проверенного сообщения в базе данных
-                    await LastMessage.findOneAndUpdate(
-                        { groupId: group },
-                        { lastMessageId: message.id },
-                        { upsert: true }
-                    );
-
-                    // Если сообщение содержит текст, проверяем ключевые слова
-                    if (message.message) {
-                        console.log(`Проверяем сообщение [ID: ${message.id}] на ключевые слова...`);
-                        console.log(`Первые 100 символов сообщения: ${message.message.substring(0, 100)}...`);
-
-                        let foundKeyword = null;
-
-                        // Проверяем основные ключевые слова
-                        for (const keyword of config.keywords) {
-                            // Создаем регулярное выражение из ключевого слова
-                            const regex = new RegExp(keyword, 'i');
-                            console.log(`Проверяем ключевое слово: '${keyword}'`);
-
-                            // Проверяем наличие ключевого слова в тексте
-                            if (regex.test(message.message)) {
-                                console.log(`Найдено ключевое слово '${keyword}' в группе ${group}`);
-                                foundKeyword = keyword;
-
-                                // Формируем ссылку на сообщение
-                                const groupName = getChannelNameFromLink(group);
-                                const messageLink = `https://t.me/${groupName}/${message.id}`;
-
-                                // Ограничиваем длину сообщения
-                                const maxMessageLength = 3000;
-                                let messageText = message.message;
-
-                                if (messageText.length > maxMessageLength - 200) {
-                                    messageText = messageText.substring(0, maxMessageLength - 250) + '...\n[Сообщение слишком длинное и было обрезано]';
-                                }
-
-                                // Добавляем в список ожидающих отправки совпадений
-                                pendingMatches.keywords.push({
-                                    group,
-                                    keyword,
-                                    messageText,
-                                    messageLink
-                                });
-
-                                break;
-                            }
-                        }
-
-                        // Проверяем комментарии, если есть ключевые слова для комментариев
-                        if (config.commentKeywords.length > 0) {
-                            console.log(`Проверяем комментарии к сообщению [ID: ${message.id}]...`);
-
-                            try {
-                                // Проверяем, поддерживает ли сообщение комментарии
-                                console.log(`Есть ли у сообщения replies:`, !!message.replies);
-
-                                if (message.replies && message.replies.replies > 0) {
-                                    // Получаем комментарии к посту
-                                    const comments = await client.getMessages(entity, {
-                                        replyTo: message.id,
-                                        limit: 100 // Ограничиваем количество проверяемых комментариев
-                                    });
-                                    // Добавляем задержку после получения комментариев
-                                    await delay(1000);
-
-                                    console.log(`Получено ${comments.length} комментариев к сообщению [ID: ${message.id}]`);
-                                    // Выведем первые несколько комментариев для отладки
-                                    if (comments.length > 0) {
-                                        console.log('Примеры комментариев:');
-                                        comments.slice(0, 3).forEach((comment, i) => {
-                                            console.log(`Комментарий ${i + 1}: ${comment.message?.substring(0, 50)}...`);
-                                        });
-                                    }
-
-                                    // Проверяем каждый комментарий на наличие ключевых слов для комментариев
-                                    for (const comment of comments) {
-                                        if (comment.message) {
-                                            console.log(`Проверяем комментарий [ID: ${comment.id}] на ключевые слова для комментариев...`);
-
-                                            for (const commentKeyword of config.commentKeywords) {
-                                                const commentRegex = new RegExp(commentKeyword, 'i');
-
-                                                if (commentRegex.test(comment.message)) {
-                                                    console.log(`Найдено ключевое слово '${commentKeyword}' в комментарии [ID: ${comment.id}]`);
-
-                                                    // Формируем ссылку на сообщение и комментарий
-                                                    const groupName = getChannelNameFromLink(group);
-                                                    const commentLink = `https://t.me/${groupName}/${message.id}?comment=${comment.id}`;
-
-                                                    // Ограничиваем длину комментария
-                                                    const maxCommentLength = 1000;
-                                                    let commentText = comment.message;
-
-                                                    if (commentText.length > maxCommentLength - 100) {
-                                                        commentText = commentText.substring(0, maxCommentLength - 150) + '...\n[Комментарий слишком длинный и был обрезан]';
-                                                    }
-
-                                                    // Добавляем в список ожидающих отправки комментариев
-                                                    pendingMatches.comments.push({
-                                                        group,
-                                                        keyword: commentKeyword,
-                                                        commentText,
-                                                        commentLink,
-                                                        messageId: message.id,
-                                                        commentId: comment.id
-                                                    });
-
-                                                    break; // Переходим к следующему комментарию после нахождения первого ключевого слова
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    console.log(`Сообщение [ID: ${message.id}] не поддерживает комментарии или комментарии отключены`);
-                                }
-                            } catch (error) {
-                                if (error.errorMessage === 'MSG_ID_INVALID') {
-                                    console.log(`Не удалось получить комментарии к сообщению [ID: ${message.id}]: сообщение не найдено или нет доступа к комментариям`);
-                                } else {
-                                    console.error(`Ошибка при проверке комментариев к сообщению [ID: ${message.id}]:`, error);
-                                }
-                            }
-                        }
-                    }
-
-                    // Добавляем задержку между проверками сообщений
-                    await delay(500);
-                }
-
-                // Добавляем задержку между проверками групп
-                await delay(2000);
-
+                await checkGroupMessages(group);
             } catch (error) {
                 console.error(`Ошибка при проверке группы ${group}:`, error);
-                // Добавляем задержку после ошибки
-                await delay(5000);
             }
+
+            // Добавляем задержку между группами
+            await delay(1000);
         }
 
         // Отправляем накопленные совпадения
-        await sendPendingMatches();
+        if (pendingMatches.keywords.length > 0 || pendingMatches.comments.length > 0) {
+            await sendPendingMatches();
+        }
 
         console.log('Проверка завершена.');
+        return true;
     } catch (error) {
         console.error('Ошибка при выполнении проверки:', error);
+        return false;
+    } finally {
+        isChecking = false; // Сбрасываем флаг проверки
     }
 }
 
@@ -456,26 +468,250 @@ async function startMonitoring() {
     }
 
     isMonitoringActive = true;
-
     console.log('Запускаем мониторинг...');
 
-    // Первая проверка сразу после запуска
+    // Отправляем сообщение о запуске мониторинга
     try {
-        await checkNewMessages();
+        await safeSendMessage(TARGET_GROUP, '✅ Мониторинг запущен! Первая проверка будет выполнена через 10 секунд.');
     } catch (error) {
-        console.error('Ошибка при первой проверке:', error);
+        console.error('Ошибка при отправке сообщения о запуске мониторинга:', error);
     }
 
-    // Устанавливаем интервал проверки
-    monitoringInterval = setInterval(async () => {
-        try {
-            await checkNewMessages();
-        } catch (error) {
-            console.error('Ошибка при периодической проверке:', error);
+    // Запускаем первую проверку через 10 секунд
+    setTimeout(() => {
+        runCheckProcess();
+    }, 10000);
+
+    // Устанавливаем интервал проверки (не ждем завершения предыдущей проверки)
+    monitoringInterval = setInterval(() => {
+        if (!isChecking) {
+            runCheckProcess();
+        } else {
+            console.log('Предыдущая проверка еще выполняется, пропускаем новую проверку');
         }
     }, config.checkInterval * 60 * 1000);
 
     return '✅ Мониторинг успешно запущен! Я буду отслеживать указанные группы на наличие ключевых слов.';
+}
+
+// Флаг, указывающий на то, что проверка уже выполняется
+let isChecking = false;
+
+function runCheckProcess() {
+    if (isChecking) {
+        console.log('Проверка уже выполняется, пропускаем');
+        return;
+    }
+
+    isChecking = true;
+
+    // Запускаем проверку в отдельном процессе
+    setTimeout(async () => {
+        try {
+            await checkNewMessages().catch(console.error);
+        } catch (error) {
+            console.error('Ошибка при выполнении проверки:', error);
+        } finally {
+            isChecking = false; // Сбрасываем флаг проверки после завершения
+        }
+    }, 0);
+}
+
+// Ограничение количества сообщений для проверки в одной группе
+const MAX_MESSAGES_PER_CHECK = 5;
+
+// Функция для проверки новых сообщений (полностью переработанная)
+async function checkGroupMessages(group) {
+    try {
+        console.log(`Проверяем группу ${group}...`);
+
+        // Получаем имя канала из ссылки
+        const channelName = getChannelNameFromLink(group);
+
+        // Получаем сущность группы/канала с защитой от таймаута
+        const entity = await safeApiRequest(
+            async () => await client.getEntity(channelName),
+            null,
+            30000 // 30 секунд на получение сущности
+        );
+
+        if (!entity) {
+            console.log(`Не удалось получить сущность для группы ${group}, пропускаем`);
+            return false;
+        }
+
+        // Получаем ID последнего проверенного сообщения из базы данных
+        let lastMessageData = await LastMessage.findOne({ groupId: group });
+
+        if (!lastMessageData) {
+            lastMessageData = new LastMessage({ groupId: group, lastMessageId: 0 });
+            await lastMessageData.save();
+        }
+
+        const lastMessageId = lastMessageData.lastMessageId;
+
+        // Получаем последние сообщения с защитой от таймаута
+        const messages = await getMessagesWithTimeout(entity, { limit: 20 }, 30000);
+
+        if (messages.length === 0) {
+            console.log(`Не удалось получить сообщения для группы ${group} или группа пуста`);
+            return false;
+        }
+
+        console.log(`Получено ${messages.length} сообщений из ${group}`);
+
+        // Задержка после получения сообщений
+        await delay(1000);
+
+        // Перебираем сообщения в обратном порядке (от старых к новым)
+        for (const message of [...messages].reverse()) {
+            // Пропускаем уже проверенные сообщения
+            if (message.id <= lastMessageId) {
+                console.log(`Пропускаем сообщение [ID: ${message.id}], т.к. оно уже было проверено (последний ID: ${lastMessageId})`);
+                continue;
+            }
+
+            // Обновляем ID последнего проверенного сообщения в базе данных
+            await LastMessage.findOneAndUpdate(
+                { groupId: group },
+                { lastMessageId: message.id },
+                { upsert: true }
+            );
+
+            // Если сообщение содержит текст, проверяем ключевые слова
+            if (message.message) {
+                // Проверяем сообщение на ключевые слова
+                await checkMessageKeywords(message, group, entity);
+            }
+
+            // Добавляем задержку между проверками сообщений
+            await delay(200);
+        }
+
+        console.log(`Проверка группы ${group} завершена.`);
+        return true;
+    } catch (error) {
+        console.error(`Ошибка при проверке группы ${group}:`, error);
+        return false;
+    }
+}
+
+// Функция для проверки ключевых слов в сообщении
+async function checkMessageKeywords(message, group, entity) {
+    try {
+        console.log(`Проверяем сообщение [ID: ${message.id}] на ключевые слова...`);
+        console.log(`Первые 100 символов сообщения: ${message.message.substring(0, 100)}...`);
+
+        // Проверяем основные ключевые слова
+        for (const keyword of config.keywords) {
+            // Создаем регулярное выражение из ключевого слова
+            const regex = new RegExp(keyword, 'i');
+            console.log(`Проверяем ключевое слово: '${keyword}'`);
+
+            // Проверяем наличие ключевого слова в тексте
+            if (regex.test(message.message)) {
+                console.log(`Найдено ключевое слово '${keyword}' в группе ${group}`);
+
+                // Формируем ссылку на сообщение
+                const groupName = getChannelNameFromLink(group);
+                const messageLink = `https://t.me/${groupName}/${message.id}`;
+
+                // Ограничиваем длину сообщения
+                const maxMessageLength = 3000;
+                let messageText = message.message;
+
+                if (messageText.length > maxMessageLength - 200) {
+                    messageText = messageText.substring(0, maxMessageLength - 250) + '...\n[Сообщение слишком длинное и было обрезано]';
+                }
+
+                // Добавляем в список ожидающих отправки совпадений
+                pendingMatches.keywords.push({
+                    group,
+                    keyword,
+                    messageText,
+                    messageLink
+                });
+
+                break;
+            }
+        }
+
+        // Проверяем комментарии только если есть ключевые слова для комментариев
+        if (config.commentKeywords.length > 0) {
+            await checkCommentsWithSafetyTimeout(message, group, entity);
+        }
+    } catch (error) {
+        console.error(`Ошибка при проверке ключевых слов в сообщении [ID: ${message.id}]:`, error);
+    }
+}
+
+
+// Функция для безопасной проверки комментариев с защитой от таймаута
+async function checkCommentsWithSafetyTimeout(message, group, entity) {
+    console.log(`Проверяем комментарии к сообщению [ID: ${message.id}]...`);
+    console.log(`Есть ли у сообщения replies:`, !!message.replies);
+
+    if (!message.replies || !message.replies.replies || message.replies.replies === 0) {
+        console.log(`Сообщение [ID: ${message.id}] не имеет комментариев`);
+        return;
+    }
+
+    try {
+        // Получаем комментарии с защитой от таймаута
+        const comments = await getMessagesWithTimeout(
+            entity,
+            { replyTo: message.id, limit: 50 },
+            30000 // 30 секунд на получение комментариев
+        );
+
+        if (comments.length === 0) {
+            console.log(`Не удалось получить комментарии к сообщению [ID: ${message.id}] или комментариев нет`);
+            return;
+        }
+
+        console.log(`Получено ${comments.length} комментариев к сообщению [ID: ${message.id}]`);
+
+        // Проверяем каждый комментарий на наличие ключевых слов для комментариев
+        for (const comment of comments) {
+            if (comment.message) {
+                console.log(`Проверяем комментарий [ID: ${comment.id}] на ключевые слова для комментариев...`);
+
+                for (const commentKeyword of config.commentKeywords) {
+                    const commentRegex = new RegExp(commentKeyword, 'i');
+
+                    if (commentRegex.test(comment.message)) {
+                        console.log(`Найдено ключевое слово '${commentKeyword}' в комментарии [ID: ${comment.id}]`);
+
+                        // Формируем ссылку на комментарий
+                        const groupName = getChannelNameFromLink(group);
+                        const commentLink = `https://t.me/${groupName}/${message.id}?comment=${comment.id}`;
+
+                        // Ограничиваем длину комментария
+                        const maxCommentLength = 1000;
+                        let commentText = comment.message;
+
+                        if (commentText.length > maxCommentLength - 100) {
+                            commentText = commentText.substring(0, maxCommentLength - 150) + '...\n[Комментарий слишком длинный и был обрезан]';
+                        }
+
+                        // Добавляем в список ожидающих отправки комментариев
+                        pendingMatches.comments.push({
+                            group,
+                            keyword: commentKeyword,
+                            commentText,
+                            commentLink,
+                            messageId: message.id,
+                            commentId: comment.id
+                        });
+
+                        break; // Переходим к следующему комментарию после нахождения первого ключевого слова
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        console.error(`Ошибка при проверке комментариев к сообщению [ID: ${message.id}]:`, error);
+    }
 }
 
 // Функция для остановки мониторинга
@@ -563,7 +799,8 @@ bot.command('start', (ctx) => {
         '➕ /add_keyword [слово] - Добавить ключевое слово\n' +
         '➖ /remove_keyword [номер] - Удалить ключевое слово\n' +
         '⚙️ /set_interval [минуты] - Установить интервал проверки\n' +
-        '📊 /status - Показать статус мониторинга'
+        '📊 /status - Показать статус мониторинга' +
+        '\n🔄 /reset_counters - Сбросить счетчики последних сообщений'
     ).then(() => {
         showMainMenu(ctx);
     });
@@ -809,6 +1046,16 @@ bot.command('status', async (ctx) => {
     }
 });
 
+bot.command('reset_counters', async (ctx) => {
+    try {
+        await resetLastMessageIds();
+        await safeSendMessage(ctx.chat.id, '✅ Счетчики последних сообщений сброшены. При следующей проверке будут просканированы все сообщения.');
+    } catch (error) {
+        console.error('Ошибка при выполнении команды reset_counters:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при сбросе счетчиков.');
+    }
+});
+
 // Команды для работы с ключевыми словами комментариев
 bot.command('list_comment_keywords', async (ctx) => {
     try {
@@ -987,18 +1234,37 @@ bot.hears('⏹️ Остановить мониторинг', async (ctx) => {
     }
 });
 
+// Обработчик команды "Проверить сейчас"
 bot.hears('🔄 Проверить сейчас', async (ctx) => {
     try {
         ctx.replyWithChatAction('typing');
-        await safeSendMessage(ctx.chat.id, '🔄 Проверяю новые сообщения...');
-        await checkNewMessages().catch(console.error);
-        await safeSendMessage(ctx.chat.id, '✅ Проверка завершена!');
+
+        if (isChecking) {
+            await safeSendMessage(ctx.chat.id, '⏳ Проверка уже выполняется, пожалуйста, подождите.');
+            return;
+        }
+
+        await safeSendMessage(ctx.chat.id, '🔄 Запускаю проверку новых сообщений в фоновом режиме...');
+
+        // Запускаем проверку, не дожидаясь ее завершения
+        setTimeout(async () => {
+            isChecking = true;
+            try {
+                await checkNewMessages().catch(console.error);
+                await safeSendMessage(ctx.chat.id, '✅ Проверка завершена!');
+            } catch (error) {
+                console.error('Ошибка при проверке сообщений:', error);
+                await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при проверке сообщений.');
+            } finally {
+                isChecking = false;
+            }
+        }, 100);
+
     } catch (error) {
-        console.error('Ошибка при проверке сообщений:', error);
-        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при проверке сообщений.');
+        console.error('Ошибка при запуске проверки сообщений:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при запуске проверки сообщений.');
     }
 });
-
 // Обработка кнопок для работы с группами
 bot.hears('📋 Список групп', async (ctx) => {
     try {
@@ -1257,18 +1523,32 @@ bot.action('stop_monitoring', async (ctx) => {
     }
 });
 
+// Обработка инлайн-кнопки "Проверить сейчас"
 bot.action('check_now', async (ctx) => {
     try {
-        await ctx.answerCbQuery('Проверяю новые сообщения...');
-        await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n🔄 Проверяю новые сообщения...');
-        await checkNewMessages().catch(console.error);
-        await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n✅ Проверка завершена!');
+        await ctx.answerCbQuery('Запускаю проверку новых сообщений...');
+
+        // Проверяем, выполняется ли уже проверка
+        if (isChecking) {
+            await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n⏳ Проверка уже выполняется. Пожалуйста, подождите.');
+            return;
+        }
+
+        await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n🔄 Запускаю проверку новых сообщений...');
+
+        // Запускаем проверку в отдельном процессе
+        runCheckProcess();
+
+        // Отправляем уведомление о запуске проверки
+        setTimeout(async () => {
+            await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n✅ Проверка запущена в фоновом режиме. Результаты будут отправлены в чат.');
+        }, 2000);
+
     } catch (error) {
-        console.error('Ошибка при проверке сообщений через инлайн-кнопку:', error);
-        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при проверке сообщений.');
+        console.error('Ошибка при запуске проверки через инлайн-кнопку:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при запуске проверки сообщений.');
     }
 });
-
 // Добавление группы через инлайн кнопку
 bot.action('add_group_dialog', async (ctx) => {
     try {
