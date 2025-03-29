@@ -14,6 +14,9 @@ const TARGET_GROUP = '-1002455984825';
 // Пути к файлам
 const SESSION_FILE = 'session.json';
 
+// Функция для добавления задержки
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 // Настройка подключения к MongoDB
 mongoose.connect('mongodb://localhost:27017/telegram_monitor', {
     useNewUrlParser: true,
@@ -53,6 +56,12 @@ let config = {
 // Переменная для контроля состояния мониторинга
 let isMonitoringActive = false;
 let monitoringInterval = null;
+
+// Переменная для хранения найденных совпадений перед отправкой
+let pendingMatches = {
+    keywords: [],
+    comments: []
+};
 
 // Загрузка сессии, если она существует
 let stringSession = new StringSession('');
@@ -134,7 +143,110 @@ async function saveConfig() {
     }
 }
 
-// Функция для проверки новых сообщений
+// Функция для безопасной отправки сообщений с обработкой ошибки Too Many Requests
+async function safeSendMessage(chatId, text, extra = {}) {
+    try {
+        await bot.telegram.sendMessage(chatId, text, extra);
+        // Добавляем небольшую задержку после каждой отправки сообщения
+        await delay(1000);
+    } catch (error) {
+        if (error.response && error.response.error_code === 429) {
+            const retryAfter = error.response.parameters.retry_after || 30;
+            console.log(`Слишком много запросов, ждем ${retryAfter} секунд...`);
+            await delay(retryAfter * 1000 + 500); // Добавляем 0.5 сек для надежности
+            // Повторная попытка отправки после ожидания
+            try {
+                await bot.telegram.sendMessage(chatId, text, extra);
+            } catch (retryError) {
+                console.error('Ошибка при повторной отправке сообщения:', retryError);
+            }
+        } else {
+            console.error('Ошибка при отправке сообщения:', error);
+        }
+    }
+}
+
+// Функция для отправки накопленных совпадений
+async function sendPendingMatches() {
+    // Отправляем накопленные совпадения по ключевым словам
+    if (pendingMatches.keywords.length > 0) {
+        // Группируем совпадения по группам
+        const groupedKeywords = {};
+        for (const match of pendingMatches.keywords) {
+            if (!groupedKeywords[match.group]) {
+                groupedKeywords[match.group] = [];
+            }
+            groupedKeywords[match.group].push(match);
+        }
+
+        // Отправляем сгруппированные совпадения
+        for (const group in groupedKeywords) {
+            const matches = groupedKeywords[group];
+            if (matches.length <= 3) {
+                // Если мало совпадений, отправляем по одному
+                for (const match of matches) {
+                    await safeSendMessage(
+                        TARGET_GROUP,
+                        `🔍 Найдено ключевое слово '${match.keyword}' в группе ${match.group}:\n\n` +
+                        `${match.messageText}\n\n` +
+                        `🔗 Ссылка: ${match.messageLink}`
+                    );
+                }
+            } else {
+                // Если много совпадений, группируем их
+                let message = `🔍 Найдено ${matches.length} совпадений ключевых слов в группе ${group}:\n\n`;
+                for (let i = 0; i < Math.min(matches.length, 10); i++) {
+                    message += `${i + 1}. '${matches[i].keyword}' - ${matches[i].messageLink}\n`;
+                }
+                message += matches.length > 10 ? `\n... и еще ${matches.length - 10} совпадений.` : '';
+                await safeSendMessage(TARGET_GROUP, message);
+            }
+        }
+
+        // Очищаем список совпадений
+        pendingMatches.keywords = [];
+    }
+
+    // Отправляем накопленные совпадения в комментариях
+    if (pendingMatches.comments.length > 0) {
+        // Группируем совпадения по группам
+        const groupedComments = {};
+        for (const match of pendingMatches.comments) {
+            if (!groupedComments[match.group]) {
+                groupedComments[match.group] = [];
+            }
+            groupedComments[match.group].push(match);
+        }
+
+        // Отправляем сгруппированные совпадения
+        for (const group in groupedComments) {
+            const matches = groupedComments[group];
+            if (matches.length <= 3) {
+                // Если мало совпадений, отправляем по одному
+                for (const match of matches) {
+                    await safeSendMessage(
+                        TARGET_GROUP,
+                        `🔍 Найдено ключевое слово '${match.keyword}' в комментарии в группе ${match.group}:\n\n` +
+                        `Комментарий: ${match.commentText}\n\n` +
+                        `🔗 Ссылка: ${match.commentLink}`
+                    );
+                }
+            } else {
+                // Если много совпадений, группируем их
+                let message = `🔍 Найдено ${matches.length} совпадений ключевых слов в комментариях группы ${group}:\n\n`;
+                for (let i = 0; i < Math.min(matches.length, 10); i++) {
+                    message += `${i + 1}. '${matches[i].keyword}' - ${matches[i].commentLink}\n`;
+                }
+                message += matches.length > 10 ? `\n... и еще ${matches.length - 10} совпадений.` : '';
+                await safeSendMessage(TARGET_GROUP, message);
+            }
+        }
+
+        // Очищаем список совпадений
+        pendingMatches.comments = [];
+    }
+}
+
 // Функция для проверки новых сообщений
 async function checkNewMessages() {
     if (!isMonitoringActive) {
@@ -142,163 +254,199 @@ async function checkNewMessages() {
         return;
     }
 
-    console.log('Проверяем новые сообщения...');
-    console.log('Текущие ключевые слова:', config.keywords);
+    console.log('Начинаем проверку...');
+    console.log('Количество ключевых слов для комментариев:', config.commentKeywords.length);
     console.log('Ключевые слова для комментариев:', config.commentKeywords);
+    console.log('Текущие ключевые слова:', config.keywords);
 
-    for (const group of config.monitoredGroups) {
-        try {
-            console.log(`Проверяем группу ${group}...`);
+    try {
+        // Очищаем накопленные совпадения
+        pendingMatches = {
+            keywords: [],
+            comments: []
+        };
 
-            // Получаем имя канала из ссылки, если это ссылка
-            const channelName = getChannelNameFromLink(group);
+        for (const group of config.monitoredGroups) {
+            try {
+                console.log(`Проверяем группу ${group}...`);
 
-            // Получаем сущность группы/канала
-            const entity = await client.getEntity(channelName);
+                // Получаем имя канала из ссылки, если это ссылка
+                const channelName = getChannelNameFromLink(group);
 
-            // Получаем последние сообщения
-            const messages = await client.getMessages(entity, { limit: 20 });
+                // Получаем сущность группы/канала
+                const entity = await client.getEntity(channelName);
 
-            console.log(`Получено ${messages.length} сообщений из ${group}`);
+                // Получаем последние сообщения
+                const messages = await client.getMessages(entity, { limit: 20 });
+                await delay(1000); // Задержка после получения сообщений
 
-            // Получаем ID последнего проверенного сообщения из базы данных
-            let lastMessageData = await LastMessage.findOne({ groupId: group });
+                console.log(`Получено ${messages.length} сообщений из ${group}`);
 
-            if (!lastMessageData) {
-                lastMessageData = new LastMessage({ groupId: group, lastMessageId: 0 });
-                await lastMessageData.save();
-            }
+                // Получаем ID последнего проверенного сообщения из базы данных
+                let lastMessageData = await LastMessage.findOne({ groupId: group });
 
-            const lastMessageId = lastMessageData.lastMessageId;
-
-            // Перебираем сообщения в обратном порядке (от старых к новым)
-            for (const message of [...messages].reverse()) {
-                // Пропускаем уже проверенные сообщения
-                if (message.id <= lastMessageId) {
-                    console.log(`Пропускаем сообщение [ID: ${message.id}], т.к. оно уже было проверено (последний ID: ${lastMessageId})`);
-                    continue;
+                if (!lastMessageData) {
+                    lastMessageData = new LastMessage({ groupId: group, lastMessageId: 0 });
+                    await lastMessageData.save();
                 }
 
-                // Обновляем ID последнего проверенного сообщения в базе данных
-                await LastMessage.findOneAndUpdate(
-                    { groupId: group },
-                    { lastMessageId: message.id },
-                    { upsert: true }
-                );
+                const lastMessageId = lastMessageData.lastMessageId;
 
-                // Если сообщение содержит текст, проверяем ключевые слова
-                if (message.message) {
-                    console.log(`Проверяем сообщение [ID: ${message.id}] на ключевые слова...`);
-                    console.log(`Первые 100 символов сообщения: ${message.message.substring(0, 100)}...`);
-
-                    let foundKeyword = null;
-                    let shouldCheckComments = false;
-
-                    // Проверяем основные ключевые слова
-                    for (const keyword of config.keywords) {
-                        // Создаем регулярное выражение из ключевого слова
-                        const regex = new RegExp(keyword, 'i');
-                        console.log(`Проверяем ключевое слово: '${keyword}'`);
-
-                        // Проверяем наличие ключевого слова в тексте
-                        if (regex.test(message.message)) {
-                            console.log(`Найдено ключевое слово '${keyword}' в группе ${group}`);
-                            foundKeyword = keyword;
-                            shouldCheckComments = true; // Отмечаем, что нужно проверить комментарии
-
-                            // Формируем ссылку на сообщение
-                            const groupName = getChannelNameFromLink(group);
-                            const messageLink = `https://t.me/${groupName}/${message.id}`;
-
-                            // Ограничиваем длину сообщения
-                            const maxMessageLength = 3000;
-                            let messageText = message.message;
-
-                            if (messageText.length > maxMessageLength - 200) {
-                                messageText = messageText.substring(0, maxMessageLength - 250) + '...\n[Сообщение слишком длинное и было обрезано]';
-                            }
-
-                            // Отправляем уведомление
-                            await bot.telegram.sendMessage(
-                                TARGET_GROUP,
-                                `🔍 Найдено ключевое слово '${keyword}' в группе ${group}:\n\n` +
-                                `${messageText}\n\n` +
-                                `🔗 Ссылка: ${messageLink}`
-                            );
-                            break;
-                        }
+                // Перебираем сообщения в обратном порядке (от старых к новым)
+                for (const message of [...messages].reverse()) {
+                    // Пропускаем уже проверенные сообщения
+                    if (message.id <= lastMessageId) {
+                        console.log(`Пропускаем сообщение [ID: ${message.id}], т.к. оно уже было проверено (последний ID: ${lastMessageId})`);
+                        continue;
                     }
 
-                    // Если найдено ключевое слово в посте и есть ключевые слова для комментариев,
-                    // проверяем комментарии к этому посту
-                    if (shouldCheckComments && config.commentKeywords.length > 0) {
-                        console.log(`Проверяем комментарии к сообщению [ID: ${message.id}]...`);
+                    // Обновляем ID последнего проверенного сообщения в базе данных
+                    await LastMessage.findOneAndUpdate(
+                        { groupId: group },
+                        { lastMessageId: message.id },
+                        { upsert: true }
+                    );
 
-                        try {
-                            // Проверяем, поддерживает ли сообщение комментарии
-                            if (message.replies) {
-                                // Получаем комментарии к посту
-                                const comments = await client.getMessages(entity, {
-                                    replyTo: message.id,
-                                    limit: 100 // Ограничиваем количество проверяемых комментариев
+                    // Если сообщение содержит текст, проверяем ключевые слова
+                    if (message.message) {
+                        console.log(`Проверяем сообщение [ID: ${message.id}] на ключевые слова...`);
+                        console.log(`Первые 100 символов сообщения: ${message.message.substring(0, 100)}...`);
+
+                        let foundKeyword = null;
+
+                        // Проверяем основные ключевые слова
+                        for (const keyword of config.keywords) {
+                            // Создаем регулярное выражение из ключевого слова
+                            const regex = new RegExp(keyword, 'i');
+                            console.log(`Проверяем ключевое слово: '${keyword}'`);
+
+                            // Проверяем наличие ключевого слова в тексте
+                            if (regex.test(message.message)) {
+                                console.log(`Найдено ключевое слово '${keyword}' в группе ${group}`);
+                                foundKeyword = keyword;
+
+                                // Формируем ссылку на сообщение
+                                const groupName = getChannelNameFromLink(group);
+                                const messageLink = `https://t.me/${groupName}/${message.id}`;
+
+                                // Ограничиваем длину сообщения
+                                const maxMessageLength = 3000;
+                                let messageText = message.message;
+
+                                if (messageText.length > maxMessageLength - 200) {
+                                    messageText = messageText.substring(0, maxMessageLength - 250) + '...\n[Сообщение слишком длинное и было обрезано]';
+                                }
+
+                                // Добавляем в список ожидающих отправки совпадений
+                                pendingMatches.keywords.push({
+                                    group,
+                                    keyword,
+                                    messageText,
+                                    messageLink
                                 });
 
-                                console.log(`Получено ${comments.length} комментариев к сообщению [ID: ${message.id}]`);
+                                break;
+                            }
+                        }
 
-                                // Проверяем каждый комментарий на наличие ключевых слов для комментариев
-                                for (const comment of comments) {
-                                    if (comment.message) {
-                                        console.log(`Проверяем комментарий [ID: ${comment.id}] на ключевые слова для комментариев...`);
+                        // Проверяем комментарии, если есть ключевые слова для комментариев
+                        if (config.commentKeywords.length > 0) {
+                            console.log(`Проверяем комментарии к сообщению [ID: ${message.id}]...`);
 
-                                        for (const commentKeyword of config.commentKeywords) {
-                                            const commentRegex = new RegExp(commentKeyword, 'i');
+                            try {
+                                // Проверяем, поддерживает ли сообщение комментарии
+                                console.log(`Есть ли у сообщения replies:`, !!message.replies);
 
-                                            if (commentRegex.test(comment.message)) {
-                                                console.log(`Найдено ключевое слово '${commentKeyword}' в комментарии [ID: ${comment.id}]`);
+                                if (message.replies && message.replies.replies > 0) {
+                                    // Получаем комментарии к посту
+                                    const comments = await client.getMessages(entity, {
+                                        replyTo: message.id,
+                                        limit: 100 // Ограничиваем количество проверяемых комментариев
+                                    });
+                                    // Добавляем задержку после получения комментариев
+                                    await delay(1000);
 
-                                                // Формируем ссылку на сообщение и комментарий
-                                                const groupName = getChannelNameFromLink(group);
-                                                const messageLink = `https://t.me/${groupName}/${message.id}?comment=${comment.id}`;
+                                    console.log(`Получено ${comments.length} комментариев к сообщению [ID: ${message.id}]`);
+                                    // Выведем первые несколько комментариев для отладки
+                                    if (comments.length > 0) {
+                                        console.log('Примеры комментариев:');
+                                        comments.slice(0, 3).forEach((comment, i) => {
+                                            console.log(`Комментарий ${i + 1}: ${comment.message?.substring(0, 50)}...`);
+                                        });
+                                    }
 
-                                                // Ограничиваем длину комментария
-                                                const maxCommentLength = 1000;
-                                                let commentText = comment.message;
+                                    // Проверяем каждый комментарий на наличие ключевых слов для комментариев
+                                    for (const comment of comments) {
+                                        if (comment.message) {
+                                            console.log(`Проверяем комментарий [ID: ${comment.id}] на ключевые слова для комментариев...`);
 
-                                                if (commentText.length > maxCommentLength - 100) {
-                                                    commentText = commentText.substring(0, maxCommentLength - 150) + '...\n[Комментарий слишком длинный и был обрезан]';
+                                            for (const commentKeyword of config.commentKeywords) {
+                                                const commentRegex = new RegExp(commentKeyword, 'i');
+
+                                                if (commentRegex.test(comment.message)) {
+                                                    console.log(`Найдено ключевое слово '${commentKeyword}' в комментарии [ID: ${comment.id}]`);
+
+                                                    // Формируем ссылку на сообщение и комментарий
+                                                    const groupName = getChannelNameFromLink(group);
+                                                    const commentLink = `https://t.me/${groupName}/${message.id}?comment=${comment.id}`;
+
+                                                    // Ограничиваем длину комментария
+                                                    const maxCommentLength = 1000;
+                                                    let commentText = comment.message;
+
+                                                    if (commentText.length > maxCommentLength - 100) {
+                                                        commentText = commentText.substring(0, maxCommentLength - 150) + '...\n[Комментарий слишком длинный и был обрезан]';
+                                                    }
+
+                                                    // Добавляем в список ожидающих отправки комментариев
+                                                    pendingMatches.comments.push({
+                                                        group,
+                                                        keyword: commentKeyword,
+                                                        commentText,
+                                                        commentLink,
+                                                        messageId: message.id,
+                                                        commentId: comment.id
+                                                    });
+
+                                                    break; // Переходим к следующему комментарию после нахождения первого ключевого слова
                                                 }
-
-                                                // Отправляем уведомление о найденном ключевом слове в комментарии
-                                                await bot.telegram.sendMessage(
-                                                    TARGET_GROUP,
-                                                    `🔍 Найдено ключевое слово '${foundKeyword}' в посте и '${commentKeyword}' в комментарии в группе ${group}:\n\n` +
-                                                    `Комментарий: ${commentText}\n\n` +
-                                                    `🔗 Ссылка: ${messageLink}`
-                                                );
-                                                break; // Переходим к следующему комментарию после нахождения первого ключевого слова
                                             }
                                         }
                                     }
+                                } else {
+                                    console.log(`Сообщение [ID: ${message.id}] не поддерживает комментарии или комментарии отключены`);
                                 }
-                            } else {
-                                console.log(`Сообщение [ID: ${message.id}] не поддерживает комментарии или комментарии отключены`);
-                            }
-                        } catch (error) {
-                            if (error.errorMessage === 'MSG_ID_INVALID') {
-                                console.log(`Не удалось получить комментарии к сообщению [ID: ${message.id}]: сообщение не найдено или нет доступа к комментариям`);
-                            } else {
-                                console.error(`Ошибка при проверке комментариев к сообщению [ID: ${message.id}]:`, error);
+                            } catch (error) {
+                                if (error.errorMessage === 'MSG_ID_INVALID') {
+                                    console.log(`Не удалось получить комментарии к сообщению [ID: ${message.id}]: сообщение не найдено или нет доступа к комментариям`);
+                                } else {
+                                    console.error(`Ошибка при проверке комментариев к сообщению [ID: ${message.id}]:`, error);
+                                }
                             }
                         }
                     }
-                }
-            }
-        } catch (error) {
-            console.error(`Ошибка при проверке группы ${group}:`, error);
-        }
-    }
 
-    console.log('Проверка завершена.');
+                    // Добавляем задержку между проверками сообщений
+                    await delay(500);
+                }
+
+                // Добавляем задержку между проверками групп
+                await delay(2000);
+
+            } catch (error) {
+                console.error(`Ошибка при проверке группы ${group}:`, error);
+                // Добавляем задержку после ошибки
+                await delay(5000);
+            }
+        }
+
+        // Отправляем накопленные совпадения
+        await sendPendingMatches();
+
+        console.log('Проверка завершена.');
+    } catch (error) {
+        console.error('Ошибка при выполнении проверки:', error);
+    }
 }
 
 // Функция для запуска мониторинга
@@ -312,11 +460,19 @@ async function startMonitoring() {
     console.log('Запускаем мониторинг...');
 
     // Первая проверка сразу после запуска
-    await checkNewMessages().catch(console.error);
+    try {
+        await checkNewMessages();
+    } catch (error) {
+        console.error('Ошибка при первой проверке:', error);
+    }
 
     // Устанавливаем интервал проверки
     monitoringInterval = setInterval(async () => {
-        await checkNewMessages().catch(console.error);
+        try {
+            await checkNewMessages();
+        } catch (error) {
+            console.error('Ошибка при периодической проверке:', error);
+        }
     }, config.checkInterval * 60 * 1000);
 
     return '✅ Мониторинг успешно запущен! Я буду отслеживать указанные группы на наличие ключевых слов.';
@@ -415,565 +571,442 @@ bot.command('start', (ctx) => {
 
 // Команда для запуска мониторинга
 bot.command('start_monitoring', async (ctx) => {
-    const result = await startMonitoring();
-    ctx.reply(result);
+    try {
+        const result = await startMonitoring();
+        await safeSendMessage(ctx.chat.id, result);
+    } catch (error) {
+        console.error('Ошибка при запуске мониторинга:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при запуске мониторинга.');
+    }
 });
 
 // Команда для остановки мониторинга
-bot.command('stop_monitoring', (ctx) => {
-    const result = stopMonitoring();
-    ctx.reply(result);
+bot.command('stop_monitoring', async (ctx) => {
+    try {
+        const result = stopMonitoring();
+        await safeSendMessage(ctx.chat.id, result);
+    } catch (error) {
+        console.error('Ошибка при остановке мониторинга:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при остановке мониторинга.');
+    }
 });
 
 // Команда для проверки новых сообщений сейчас
 bot.command('check_now', async (ctx) => {
-    ctx.reply('🔄 Проверяю новые сообщения...');
-    await checkNewMessages().catch(console.error);
-    ctx.reply('✅ Проверка завершена!');
+    try {
+        await safeSendMessage(ctx.chat.id, '🔄 Проверяю новые сообщения...');
+        await checkNewMessages().catch(console.error);
+        await safeSendMessage(ctx.chat.id, '✅ Проверка завершена!');
+    } catch (error) {
+        console.error('Ошибка при проверке новых сообщений:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при проверке новых сообщений.');
+    }
 });
 
 // Команда для добавления ключевого слова
 bot.command('add_keyword', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    if (args.length < 2) {
-        return ctx.reply('⚠️ Пожалуйста, укажите ключевое слово для добавления.\nПример: /add_keyword javascript');
-    }
+    try {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return safeSendMessage(ctx.chat.id, '⚠️ Пожалуйста, укажите ключевое слово для добавления.\nПример: /add_keyword javascript');
+        }
 
-    const newKeyword = args.slice(1).join(' ');
+        const newKeyword = args.slice(1).join(' ');
 
-    if (!config.keywords.includes(newKeyword)) {
-        config.keywords.push(newKeyword);
-        await saveConfig();
-        ctx.reply(`✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга.`);
-    } else {
-        ctx.reply(`⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга.`);
+        if (!config.keywords.includes(newKeyword)) {
+            config.keywords.push(newKeyword);
+            await saveConfig();
+            await safeSendMessage(ctx.chat.id, `✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга.`);
+        } else {
+            await safeSendMessage(ctx.chat.id, `⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга.`);
+        }
+    } catch (error) {
+        console.error('Ошибка при добавлении ключевого слова:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при добавлении ключевого слова.');
     }
 });
 
 // Команда для удаления ключевого слова
 bot.command('remove_keyword', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    if (args.length < 2) {
-        return ctx.reply('⚠️ Пожалуйста, укажите номер ключевого слова для удаления.\nПример: /remove_keyword 1');
+    try {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return safeSendMessage(ctx.chat.id, '⚠️ Пожалуйста, укажите номер ключевого слова для удаления.\nПример: /remove_keyword 1');
+        }
+
+        const keywordIndex = parseInt(args[1]) - 1;
+
+        if (isNaN(keywordIndex) || keywordIndex < 0 || keywordIndex >= config.keywords.length) {
+            return safeSendMessage(ctx.chat.id, `⚠️ Некорректный номер. Введите число от 1 до ${config.keywords.length}.`);
+        }
+
+        const removedKeyword = config.keywords[keywordIndex];
+        config.keywords.splice(keywordIndex, 1);
+        await saveConfig();
+
+        await safeSendMessage(ctx.chat.id, `✅ Ключевое слово '${removedKeyword}' удалено из списка мониторинга.`);
+    } catch (error) {
+        console.error('Ошибка при удалении ключевого слова:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при удалении ключевого слова.');
     }
-
-    const keywordIndex = parseInt(args[1]) - 1;
-
-    if (isNaN(keywordIndex) || keywordIndex < 0 || keywordIndex >= config.keywords.length) {
-        return ctx.reply(`⚠️ Некорректный номер. Введите число от 1 до ${config.keywords.length}.`);
-    }
-
-    const removedKeyword = config.keywords[keywordIndex];
-    config.keywords.splice(keywordIndex, 1);
-    await saveConfig();
-
-    ctx.reply(`✅ Ключевое слово '${removedKeyword}' удалено из списка мониторинга.`);
 });
 
 // Команда для просмотра списка ключевых слов
-bot.command('list_keywords', (ctx) => {
-    if (config.keywords.length === 0) {
-        return ctx.reply('📝 Список ключевых слов для мониторинга пуст.');
+bot.command('list_keywords', async (ctx) => {
+    try {
+        if (config.keywords.length === 0) {
+            return safeSendMessage(ctx.chat.id, '📝 Список ключевых слов для мониторинга пуст.');
+        }
+
+        let message = '📝 Ключевые слова для мониторинга:\n';
+        config.keywords.forEach((keyword, index) => {
+            message += `${index + 1}. ${keyword}\n`;
+        });
+
+        await safeSendMessage(ctx.chat.id, message);
+    } catch (error) {
+        console.error('Ошибка при отображении списка ключевых слов:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении списка ключевых слов.');
     }
-
-    let message = '📝 Ключевые слова для мониторинга:\n';
-    config.keywords.forEach((keyword, index) => {
-        message += `${index + 1}. ${keyword}\n`;
-    });
-
-    ctx.reply(message);
 });
 
 // Команда для добавления новой группы для мониторинга
 bot.command('add_group', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    if (args.length < 2) {
-        return ctx.reply('⚠️ Пожалуйста, укажите группу для добавления.\nПример: /add_group @channel_name или /add_group https://t.me/channel_name');
-    }
+    try {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return safeSendMessage(ctx.chat.id, '⚠️ Пожалуйста, укажите группу для добавления.\nПример: /add_group @channel_name или /add_group https://t.me/channel_name');
+        }
 
-    const newGroup = args[1];
+        const newGroup = args[1];
 
-    if (!config.monitoredGroups.includes(newGroup)) {
-        config.monitoredGroups.push(newGroup);
-        await saveConfig();
+        if (!config.monitoredGroups.includes(newGroup)) {
+            config.monitoredGroups.push(newGroup);
+            await saveConfig();
 
-        // Создаем запись для отслеживания последнего сообщения
-        await LastMessage.findOneAndUpdate(
-            { groupId: newGroup },
-            { lastMessageId: 0 },
-            { upsert: true }
-        );
+            // Создаем запись для отслеживания последнего сообщения
+            await LastMessage.findOneAndUpdate(
+                { groupId: newGroup },
+                { lastMessageId: 0 },
+                { upsert: true }
+            );
 
-        ctx.reply(`✅ Группа ${newGroup} добавлена в список мониторинга.`);
-    } else {
-        ctx.reply(`⚠️ Группа ${newGroup} уже есть в списке мониторинга.`);
+            await safeSendMessage(ctx.chat.id, `✅ Группа ${newGroup} добавлена в список мониторинга.`);
+        } else {
+            await safeSendMessage(ctx.chat.id, `⚠️ Группа ${newGroup} уже есть в списке мониторинга.`);
+        }
+    } catch (error) {
+        console.error('Ошибка при добавлении группы:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при добавлении группы.');
     }
 });
 
 // Команда для удаления группы из мониторинга
 bot.command('remove_group', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    if (args.length < 2) {
-        return ctx.reply('⚠️ Пожалуйста, укажите номер группы для удаления.\nПример: /remove_group 1');
+    try {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return safeSendMessage(ctx.chat.id, '⚠️ Пожалуйста, укажите номер группы для удаления.\nПример: /remove_group 1');
+        }
+
+        const groupIndex = parseInt(args[1]) - 1;
+
+        if (isNaN(groupIndex) || groupIndex < 0 || groupIndex >= config.monitoredGroups.length) {
+            return safeSendMessage(ctx.chat.id, `⚠️ Некорректный номер. Введите число от 1 до ${config.monitoredGroups.length}.`);
+        }
+
+        const removedGroup = config.monitoredGroups[groupIndex];
+        config.monitoredGroups.splice(groupIndex, 1);
+        await saveConfig();
+
+        // Удаляем запись о последнем сообщении
+        await LastMessage.deleteOne({ groupId: removedGroup });
+
+        await safeSendMessage(ctx.chat.id, `✅ Группа ${removedGroup} удалена из списка мониторинга.`);
+    } catch (error) {
+        console.error('Ошибка при удалении группы:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при удалении группы.');
     }
-
-    const groupIndex = parseInt(args[1]) - 1;
-
-    if (isNaN(groupIndex) || groupIndex < 0 || groupIndex >= config.monitoredGroups.length) {
-        return ctx.reply(`⚠️ Некорректный номер. Введите число от 1 до ${config.monitoredGroups.length}.`);
-    }
-
-    const removedGroup = config.monitoredGroups[groupIndex];
-    config.monitoredGroups.splice(groupIndex, 1);
-    await saveConfig();
-
-    // Удаляем запись о последнем сообщении
-    await LastMessage.deleteOne({ groupId: removedGroup });
-
-    ctx.reply(`✅ Группа ${removedGroup} удалена из списка мониторинга.`);
 });
 
 // Команда для просмотра списка мониторинга
-bot.command('list_groups', (ctx) => {
-    if (config.monitoredGroups.length === 0) {
-        return ctx.reply('📋 Список групп для мониторинга пуст.');
+bot.command('list_groups', async (ctx) => {
+    try {
+        if (config.monitoredGroups.length === 0) {
+            return safeSendMessage(ctx.chat.id, '📋 Список групп для мониторинга пуст.');
+        }
+
+        let message = '📋 Группы для мониторинга:\n';
+        config.monitoredGroups.forEach((group, index) => {
+            message += `${index + 1}. ${group}\n`;
+        });
+
+        await safeSendMessage(ctx.chat.id, message);
+    } catch (error) {
+        console.error('Ошибка при отображении списка групп:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении списка групп.');
     }
-
-    let message = '📋 Группы для мониторинга:\n';
-    config.monitoredGroups.forEach((group, index) => {
-        message += `${index + 1}. ${group}\n`;
-    });
-
-    ctx.reply(message);
 });
 
 // Команда для установки интервала проверки
 bot.command('set_interval', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    if (args.length < 2) {
-        return ctx.reply('⚠️ Пожалуйста, укажите интервал в минутах.\nПример: /set_interval 10');
+    try {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return safeSendMessage(ctx.chat.id, '⚠️ Пожалуйста, укажите интервал в минутах.\nПример: /set_interval 10');
+        }
+
+        const newInterval = parseInt(args[1]);
+
+        if (isNaN(newInterval) || newInterval < 1) {
+            return safeSendMessage(ctx.chat.id, '⚠️ Некорректный интервал. Введите число больше 0.');
+        }
+
+        config.checkInterval = newInterval;
+        await saveConfig();
+
+        // Если мониторинг активен, перезапускаем с новым интервалом
+        if (isMonitoringActive && monitoringInterval) {
+            clearInterval(monitoringInterval);
+            monitoringInterval = setInterval(async () => {
+                await checkNewMessages().catch(console.error);
+            }, config.checkInterval * 60 * 1000);
+        }
+
+        await safeSendMessage(ctx.chat.id, `⚙️ Интервал проверки установлен на ${newInterval} минут.`);
+    } catch (error) {
+        console.error('Ошибка при установке интервала:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при установке интервала.');
     }
-
-    const newInterval = parseInt(args[1]);
-
-    if (isNaN(newInterval) || newInterval < 1) {
-        return ctx.reply('⚠️ Некорректный интервал. Введите число больше 0.');
-    }
-
-    config.checkInterval = newInterval;
-    await saveConfig();
-
-    // Если мониторинг активен, перезапускаем с новым интервалом
-    if (isMonitoringActive && monitoringInterval) {
-        clearInterval(monitoringInterval);
-        monitoringInterval = setInterval(async () => {
-            await checkNewMessages().catch(console.error);
-        }, config.checkInterval * 60 * 1000);
-    }
-
-    ctx.reply(`⚙️ Интервал проверки установлен на ${newInterval} минут.`);
 });
 
 // Команда для просмотра статуса
-bot.command('status', (ctx) => {
-    const status = isMonitoringActive ? '✅ Активен' : '🛑 Остановлен';
+bot.command('status', async (ctx) => {
+    try {
+        const status = isMonitoringActive ? '✅ Активен' : '🛑 Остановлен';
 
-    let message = `📊 Статус мониторинга: ${status}\n`;
-    message += `⏱️ Интервал проверки: ${config.checkInterval} минут\n`;
-    message += `👁️ Групп в мониторинге: ${config.monitoredGroups.length}\n`;
-    message += `🔍 Ключевых слов: ${config.keywords.length}\n`;
-    message += `💬 Ключевых слов для комментариев: ${config.commentKeywords.length}`;
+        let message = `📊 Статус мониторинга: ${status}\n`;
+        message += `⏱️ Интервал проверки: ${config.checkInterval} минут\n`;
+        message += `👁️ Групп в мониторинге: ${config.monitoredGroups.length}\n`;
+        message += `🔍 Ключевых слов: ${config.keywords.length}\n`;
+        message += `💬 Ключевых слов для комментариев: ${config.commentKeywords.length}`;
 
-    // Создаем инлайн-клавиатуру с кнопками управления
-    const inlineKeyboard = isMonitoringActive
-        ? Markup.inlineKeyboard([
-            Markup.button.callback('⏹️ Остановить мониторинг', 'stop_monitoring'),
-            Markup.button.callback('🔄 Проверить сейчас', 'check_now')
-        ])
-        : Markup.inlineKeyboard([
-            Markup.button.callback('▶️ Запустить мониторинг', 'start_monitoring'),
-            Markup.button.callback('🔄 Проверить сейчас', 'check_now')
-        ]);
+        // Создаем инлайн-клавиатуру с кнопками управления
+        const inlineKeyboard = isMonitoringActive
+            ? Markup.inlineKeyboard([
+                Markup.button.callback('⏹️ Остановить мониторинг', 'stop_monitoring'),
+                Markup.button.callback('🔄 Проверить сейчас', 'check_now')
+            ])
+            : Markup.inlineKeyboard([
+                Markup.button.callback('▶️ Запустить мониторинг', 'start_monitoring'),
+                Markup.button.callback('🔄 Проверить сейчас', 'check_now')
+            ]);
 
-    ctx.reply(message, inlineKeyboard);
+        await safeSendMessage(ctx.chat.id, message, inlineKeyboard);
+    } catch (error) {
+        console.error('Ошибка при отображении статуса:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении статуса.');
+    }
 });
 
 // Команды для работы с ключевыми словами комментариев
-bot.command('list_comment_keywords', (ctx) => {
-    if (config.commentKeywords.length === 0) {
-        return ctx.reply('📝 Список ключевых слов для комментариев пуст.');
+bot.command('list_comment_keywords', async (ctx) => {
+    try {
+        if (config.commentKeywords.length === 0) {
+            return safeSendMessage(ctx.chat.id, '📝 Список ключевых слов для комментариев пуст.');
+        }
+
+        let message = '📝 Ключевые слова для комментариев:\n';
+        config.commentKeywords.forEach((keyword, index) => {
+            message += `${index + 1}. ${keyword}\n`;
+        });
+
+        await safeSendMessage(ctx.chat.id, message);
+    } catch (error) {
+        console.error('Ошибка при отображении списка ключевых слов комментариев:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении списка ключевых слов комментариев.');
     }
-
-    let message = '📝 Ключевые слова для комментариев:\n';
-    config.commentKeywords.forEach((keyword, index) => {
-        message += `${index + 1}. ${keyword}\n`;
-    });
-
-    ctx.reply(message);
 });
 
 bot.command('add_comment_keyword', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    if (args.length < 2) {
-        return ctx.reply('⚠️ Пожалуйста, укажите ключевое слово для добавления в список комментариев.\nПример: /add_comment_keyword javascript');
-    }
+    try {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return safeSendMessage(ctx.chat.id, '⚠️ Пожалуйста, укажите ключевое слово для добавления в список комментариев.\nПример: /add_comment_keyword javascript');
+        }
 
-    const newKeyword = args.slice(1).join(' ');
+        const newKeyword = args.slice(1).join(' ');
 
-    if (!config.commentKeywords.includes(newKeyword)) {
-        config.commentKeywords.push(newKeyword);
-        await saveConfig();
-        ctx.reply(`✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга комментариев.`);
-    } else {
-        ctx.reply(`⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга комментариев.`);
+        if (!config.commentKeywords.includes(newKeyword)) {
+            config.commentKeywords.push(newKeyword);
+            await saveConfig();
+            await safeSendMessage(ctx.chat.id, `✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга комментариев.`);
+        } else {
+            await safeSendMessage(ctx.chat.id, `⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга комментариев.`);
+        }
+    } catch (error) {
+        console.error('Ошибка при добавлении ключевого слова для комментариев:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при добавлении ключевого слова для комментариев.');
     }
 });
 
 bot.command('remove_comment_keyword', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    if (args.length < 2) {
-        return ctx.reply('⚠️ Пожалуйста, укажите номер ключевого слова для удаления из списка комментариев.\nПример: /remove_comment_keyword 1');
+    try {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return safeSendMessage(ctx.chat.id, '⚠️ Пожалуйста, укажите номер ключевого слова для удаления из списка комментариев.\nПример: /remove_comment_keyword 1');
+        }
+
+        const keywordIndex = parseInt(args[1]) - 1;
+
+        if (isNaN(keywordIndex) || keywordIndex < 0 || keywordIndex >= config.commentKeywords.length) {
+            return safeSendMessage(ctx.chat.id, `⚠️ Некорректный номер. Введите число от 1 до ${config.commentKeywords.length}.`);
+        }
+
+        const removedKeyword = config.commentKeywords[keywordIndex];
+        config.commentKeywords.splice(keywordIndex, 1);
+        await saveConfig();
+
+        await safeSendMessage(ctx.chat.id, `✅ Ключевое слово '${removedKeyword}' удалено из списка мониторинга комментариев.`);
+    } catch (error) {
+        console.error('Ошибка при удалении ключевого слова для комментариев:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при удалении ключевого слова для комментариев.');
     }
-
-    const keywordIndex = parseInt(args[1]) - 1;
-
-    if (isNaN(keywordIndex) || keywordIndex < 0 || keywordIndex >= config.commentKeywords.length) {
-        return ctx.reply(`⚠️ Некорректный номер. Введите число от 1 до ${config.commentKeywords.length}.`);
-    }
-
-    const removedKeyword = config.commentKeywords[keywordIndex];
-    config.commentKeywords.splice(keywordIndex, 1);
-    await saveConfig();
-
-    ctx.reply(`✅ Ключевое слово '${removedKeyword}' удалено из списка мониторинга комментариев.`);
 });
 
 // Обработка нажатий на кнопки меню
-bot.hears('▶️ Управление', (ctx) => {
-    ctx.reply('Выберите действие:', controlMenuKeyboard);
+bot.hears('▶️ Управление', async (ctx) => {
+    try {
+        await safeSendMessage(ctx.chat.id, 'Выберите действие:', controlMenuKeyboard);
+    } catch (error) {
+        console.error('Ошибка при открытии меню управления:', error);
+    }
 });
 
-bot.hears('📋 Группы', (ctx) => {
-    ctx.reply('Управление группами для мониторинга:', groupsMenuKeyboard);
+bot.hears('📋 Группы', async (ctx) => {
+    try {
+        await safeSendMessage(ctx.chat.id, 'Управление группами для мониторинга:', groupsMenuKeyboard);
+    } catch (error) {
+        console.error('Ошибка при открытии меню групп:', error);
+    }
 });
 
-bot.hears('🔍 Ключевые слова', (ctx) => {
-    ctx.reply('Управление ключевыми словами:', keywordsMenuKeyboard);
+bot.hears('🔍 Ключевые слова', async (ctx) => {
+    try {
+        await safeSendMessage(ctx.chat.id, 'Управление ключевыми словами:', keywordsMenuKeyboard);
+    } catch (error) {
+        console.error('Ошибка при открытии меню ключевых слов:', error);
+    }
 });
 
-bot.hears('⚙️ Настройки', (ctx) => {
-    ctx.reply('Настройки бота:', settingsMenuKeyboard);
+bot.hears('⚙️ Настройки', async (ctx) => {
+    try {
+        await safeSendMessage(ctx.chat.id, 'Настройки бота:', settingsMenuKeyboard);
+    } catch (error) {
+        console.error('Ошибка при открытии меню настроек:', error);
+    }
 });
 
-bot.hears('🔙 Назад в главное меню', (ctx) => {
-    showMainMenu(ctx);
+bot.hears('🔙 Назад в главное меню', async (ctx) => {
+    try {
+        await showMainMenu(ctx);
+    } catch (error) {
+        console.error('Ошибка при возврате в главное меню:', error);
+    }
 });
 
-bot.hears('📊 Статус', (ctx) => {
-    ctx.replyWithChatAction('typing');
-    const status = isMonitoringActive ? '✅ Активен' : '🛑 Остановлен';
+bot.hears('📊 Статус', async (ctx) => {
+    try {
+        ctx.replyWithChatAction('typing');
+        const status = isMonitoringActive ? '✅ Активен' : '🛑 Остановлен';
 
-    let message = `📊 Статус мониторинга: ${status}\n`;
-    message += `⏱️ Интервал проверки: ${config.checkInterval} минут\n`;
-    message += `👁️ Групп в мониторинге: ${config.monitoredGroups.length}\n`;
-    message += `🔍 Ключевых слов: ${config.keywords.length}\n`;
-    message += `💬 Ключевых слов для комментариев: ${config.commentKeywords.length}`;
+        let message = `📊 Статус мониторинга: ${status}\n`;
+        message += `⏱️ Интервал проверки: ${config.checkInterval} минут\n`;
+        message += `👁️ Групп в мониторинге: ${config.monitoredGroups.length}\n`;
+        message += `🔍 Ключевых слов: ${config.keywords.length}\n`;
+        message += `💬 Ключевых слов для комментариев: ${config.commentKeywords.length}`;
 
-    const inlineKeyboard = isMonitoringActive
-        ? Markup.inlineKeyboard([
-            Markup.button.callback('⏹️ Остановить мониторинг', 'stop_monitoring'),
-            Markup.button.callback('🔄 Проверить сейчас', 'check_now')
-        ])
-        : Markup.inlineKeyboard([
-            Markup.button.callback('▶️ Запустить мониторинг', 'start_monitoring'),
-            Markup.button.callback('🔄 Проверить сейчас', 'check_now')
-        ]);
+        const inlineKeyboard = isMonitoringActive
+            ? Markup.inlineKeyboard([
+                Markup.button.callback('⏹️ Остановить мониторинг', 'stop_monitoring'),
+                Markup.button.callback('🔄 Проверить сейчас', 'check_now')
+            ])
+            : Markup.inlineKeyboard([
+                Markup.button.callback('▶️ Запустить мониторинг', 'start_monitoring'),
+                Markup.button.callback('🔄 Проверить сейчас', 'check_now')
+            ]);
 
-    ctx.reply(message, inlineKeyboard);
+        await safeSendMessage(ctx.chat.id, message, inlineKeyboard);
+    } catch (error) {
+        console.error('Ошибка при отображении статуса:', error);
+    }
 });
 
-bot.hears('❓ Помощь', (ctx) => {
-    ctx.reply(
-        '❓ <b>Справка по использованию бота</b>\n\n' +
-        '<b>▶️ Управление</b> - запуск, остановка и проверка мониторинга\n' +
-        '<b>📋 Группы</b> - управление списком групп для мониторинга\n' +
-        '<b>🔍 Ключевые слова</b> - управление списком ключевых слов\n' +
-        '<b>⚙️ Настройки</b> - настройка интервала проверки и другие параметры\n' +
-        '<b>📊 Статус</b> - информация о текущем состоянии бота\n\n' +
-        'Вы также можете использовать команды напрямую:\n' +
-        '/start_monitoring - запустить мониторинг\n' +
-        '/stop_monitoring - остановить мониторинг\n' +
-        '/check_now - проверить сейчас\n' +
-        '/status - показать статус',
-        { parse_mode: 'HTML' }
-    );
+bot.hears('❓ Помощь', async (ctx) => {
+    try {
+        await safeSendMessage(
+            ctx.chat.id,
+            '❓ <b>Справка по использованию бота</b>\n\n' +
+            '<b>▶️ Управление</b> - запуск, остановка и проверка мониторинга\n' +
+            '<b>📋 Группы</b> - управление списком групп для мониторинга\n' +
+            '<b>🔍 Ключевые слова</b> - управление списком ключевых слов\n' +
+            '<b>⚙️ Настройки</b> - настройка интервала проверки и другие параметры\n' +
+            '<b>📊 Статус</b> - информация о текущем состоянии бота\n\n' +
+            'Вы также можете использовать команды напрямую:\n' +
+            '/start_monitoring - запустить мониторинг\n' +
+            '/stop_monitoring - остановить мониторинг\n' +
+            '/check_now - проверить сейчас\n' +
+            '/status - показать статус',
+            { parse_mode: 'HTML' }
+        );
+    } catch (error) {
+        console.error('Ошибка при отображении справки:', error);
+    }
 });
 
 // Обработка кнопок управления мониторингом
 bot.hears('▶️ Запустить мониторинг', async (ctx) => {
-    ctx.replyWithChatAction('typing');
-    const result = await startMonitoring();
-    ctx.reply(result);
+    try {
+        ctx.replyWithChatAction('typing');
+        const result = await startMonitoring();
+        await safeSendMessage(ctx.chat.id, result);
+    } catch (error) {
+        console.error('Ошибка при запуске мониторинга:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при запуске мониторинга.');
+    }
 });
 
-bot.hears('⏹️ Остановить мониторинг', (ctx) => {
-    ctx.replyWithChatAction('typing');
-    const result = stopMonitoring();
-    ctx.reply(result);
+bot.hears('⏹️ Остановить мониторинг', async (ctx) => {
+    try {
+        ctx.replyWithChatAction('typing');
+        const result = stopMonitoring();
+        await safeSendMessage(ctx.chat.id, result);
+    } catch (error) {
+        console.error('Ошибка при остановке мониторинга:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при остановке мониторинга.');
+    }
 });
 
 bot.hears('🔄 Проверить сейчас', async (ctx) => {
-    ctx.replyWithChatAction('typing');
-    await ctx.reply('🔄 Проверяю новые сообщения...');
-    await checkNewMessages().catch(console.error);
-    ctx.reply('✅ Проверка завершена!');
+    try {
+        ctx.replyWithChatAction('typing');
+        await safeSendMessage(ctx.chat.id, '🔄 Проверяю новые сообщения...');
+        await checkNewMessages().catch(console.error);
+        await safeSendMessage(ctx.chat.id, '✅ Проверка завершена!');
+    } catch (error) {
+        console.error('Ошибка при проверке сообщений:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при проверке сообщений.');
+    }
 });
 
 // Обработка кнопок для работы с группами
 bot.hears('📋 Список групп', async (ctx) => {
-    ctx.replyWithChatAction('typing');
-    if (config.monitoredGroups.length === 0) {
-        return ctx.reply('📋 Список групп для мониторинга пуст.');
-    }
+    try {
+        ctx.replyWithChatAction('typing');
+        if (config.monitoredGroups.length === 0) {
+            return safeSendMessage(ctx.chat.id, '📋 Список групп для мониторинга пуст.');
+        }
 
-    let message = '📋 Группы для мониторинга:\n';
-    const buttons = [];
-
-    config.monitoredGroups.forEach((group, index) => {
-        message += `${index + 1}. ${group}\n`;
-        buttons.push([Markup.button.callback(`❌ Удалить ${index + 1}`, `remove_group_${index}`)]);
-    });
-
-    const inlineKeyboard = Markup.inlineKeyboard([
-        ...buttons,
-        [Markup.button.callback('➕ Добавить новую группу', 'add_group_dialog')]
-    ]);
-
-    ctx.reply(message, inlineKeyboard);
-});
-
-bot.hears('➕ Добавить группу', (ctx) => {
-    ctx.replyWithChatAction('typing');
-    ctx.reply(
-        '➕ Чтобы добавить группу, отправьте команду в формате:\n' +
-        '/add_group @channel_name\n' +
-        'или\n' +
-        '/add_group https://t.me/channel_name'
-    );
-});
-
-bot.hears('➖ Удалить группу', async (ctx) => {
-    ctx.replyWithChatAction('typing');
-    if (config.monitoredGroups.length === 0) {
-        return ctx.reply('📋 Список групп для мониторинга пуст.');
-    }
-
-    let message = '➖ Выберите группу для удаления:\n';
-    const buttons = [];
-
-    config.monitoredGroups.forEach((group, index) => {
-        message += `${index + 1}. ${group}\n`;
-        buttons.push([Markup.button.callback(`❌ ${index + 1}. ${group}`, `remove_group_${index}`)]);
-    });
-
-    ctx.reply(message, Markup.inlineKeyboard(buttons));
-});
-
-// Обработка кнопок для работы с ключевыми словами
-bot.hears('📝 Список ключевых слов', (ctx) => {
-    ctx.replyWithChatAction('typing');
-    if (config.keywords.length === 0) {
-        return ctx.reply('📝 Список ключевых слов для мониторинга пуст.');
-    }
-
-    let message = '📝 Ключевые слова для мониторинга:\n';
-    const buttons = [];
-
-    config.keywords.forEach((keyword, index) => {
-        message += `${index + 1}. ${keyword}\n`;
-        buttons.push([Markup.button.callback(`❌ Удалить ${index + 1}`, `remove_keyword_${index}`)]);
-    });
-
-    const inlineKeyboard = Markup.inlineKeyboard([
-        ...buttons,
-        [Markup.button.callback('➕ Добавить новое слово', 'add_keyword_dialog')]
-    ]);
-
-    ctx.reply(message, inlineKeyboard);
-});
-
-bot.hears('➕ Добавить ключевое слово', (ctx) => {
-    ctx.replyWithChatAction('typing');
-    ctx.reply(
-        '➕ Чтобы добавить ключевое слово, отправьте команду в формате:\n' +
-        '/add_keyword javascript\n\n' +
-        'Вы можете добавить несколько слов, разделив их запятыми:\n' +
-        '/add_keyword javascript, python, telegram'
-    );
-});
-
-bot.hears('➖ Удалить ключевое слово', (ctx) => {
-    ctx.replyWithChatAction('typing');
-    if (config.keywords.length === 0) {
-        return ctx.reply('📝 Список ключевых слов для мониторинга пуст.');
-    }
-
-    let message = '➖ Выберите ключевое слово для удаления:\n';
-    const buttons = [];
-
-    config.keywords.forEach((keyword, index) => {
-        message += `${index + 1}. ${keyword}\n`;
-        buttons.push([Markup.button.callback(`❌ ${index + 1}. ${keyword}`, `remove_keyword_${index}`)]);
-    });
-
-    ctx.reply(message, Markup.inlineKeyboard(buttons));
-});
-
-// Обработка кнопок настроек
-bot.hears('⏱️ Установить интервал', (ctx) => {
-    ctx.replyWithChatAction('typing');
-    const buttons = [
-        [
-            Markup.button.callback('1 минута', 'set_interval_1'),
-            Markup.button.callback('5 минут', 'set_interval_5'),
-            Markup.button.callback('10 минут', 'set_interval_10')
-        ],
-        [
-            Markup.button.callback('15 минут', 'set_interval_15'),
-            Markup.button.callback('30 минут', 'set_interval_30'),
-            Markup.button.callback('1 час', 'set_interval_60')
-        ]
-    ];
-
-    ctx.reply(
-        `⏱️ Текущий интервал проверки: ${config.checkInterval} минут\n\n` +
-        'Выберите новый интервал или введите команду:\n' +
-        '/set_interval [минуты]',
-        Markup.inlineKeyboard(buttons)
-    );
-});
-
-// Обработчики для новых пунктов меню
-bot.hears('📝 Список ключевых слов комментариев', (ctx) => {
-    ctx.replyWithChatAction('typing');
-    if (config.commentKeywords.length === 0) {
-        return ctx.reply('📝 Список ключевых слов для комментариев пуст.');
-    }
-
-    let message = '📝 Ключевые слова для комментариев:\n';
-    const buttons = [];
-
-    config.commentKeywords.forEach((keyword, index) => {
-        message += `${index + 1}. ${keyword}\n`;
-        buttons.push([Markup.button.callback(`❌ Удалить ${index + 1}`, `remove_comment_keyword_${index}`)]);
-    });
-
-    const inlineKeyboard = Markup.inlineKeyboard([
-        ...buttons,
-        [Markup.button.callback('➕ Добавить новое слово', 'add_comment_keyword_dialog')]
-    ]);
-
-    ctx.reply(message, inlineKeyboard);
-});
-
-bot.hears('➕ Добавить ключевое слово комментариев', (ctx) => {
-    ctx.replyWithChatAction('typing');
-    ctx.reply(
-        '➕ Чтобы добавить ключевое слово для комментариев, отправьте команду в формате:\n' +
-        '/add_comment_keyword javascript\n\n' +
-        'Вы можете добавить несколько слов, разделив их запятыми:\n' +
-        '/add_comment_keyword javascript, python, telegram'
-    );
-});
-
-bot.hears('➖ Удалить ключевое слово комментариев', (ctx) => {
-    ctx.replyWithChatAction('typing');
-    if (config.commentKeywords.length === 0) {
-        return ctx.reply('📝 Список ключевых слов для комментариев пуст.');
-    }
-
-    let message = '➖ Выберите ключевое слово для удаления из списка комментариев:\n';
-    const buttons = [];
-
-    config.commentKeywords.forEach((keyword, index) => {
-        message += `${index + 1}. ${keyword}\n`;
-        buttons.push([Markup.button.callback(`❌ ${index + 1}. ${keyword}`, `remove_comment_keyword_${index}`)]);
-    });
-
-    ctx.reply(message, Markup.inlineKeyboard(buttons));
-});
-
-// Обработка нажатий на инлайн-кнопки
-bot.action('start_monitoring', async (ctx) => {
-    await ctx.answerCbQuery('Запускаю мониторинг...');
-    const result = await startMonitoring();
-    await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n' + result);
-    // Обновляем кнопки
-    await ctx.editMessageReplyMarkup(Markup.inlineKeyboard([
-        Markup.button.callback('⏹️ Остановить мониторинг', 'stop_monitoring'),
-        Markup.button.callback('🔄 Проверить сейчас', 'check_now')
-    ]).reply_markup);
-});
-
-bot.action('stop_monitoring', async (ctx) => {
-    await ctx.answerCbQuery('Останавливаю мониторинг...');
-    const result = stopMonitoring();
-    await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n' + result);
-    // Обновляем кнопки
-    await ctx.editMessageReplyMarkup(Markup.inlineKeyboard([
-        Markup.button.callback('▶️ Запустить мониторинг', 'start_monitoring'),
-        Markup.button.callback('🔄 Проверить сейчас', 'check_now')
-    ]).reply_markup);
-});
-
-bot.action('check_now', async (ctx) => {
-    await ctx.answerCbQuery('Проверяю новые сообщения...');
-    await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n🔄 Проверяю новые сообщения...');
-    await checkNewMessages().catch(console.error);
-    await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n✅ Проверка завершена!');
-});
-
-// Добавление группы через инлайн кнопку
-bot.action('add_group_dialog', async (ctx) => {
-    await ctx.answerCbQuery();
-    // Сохраняем состояние пользователя
-    setUserState(ctx.from.id, { waitingForGroup: true });
-    await ctx.reply('Отправьте ссылку на группу или канал (например, @channel_name или https://t.me/channel_name):');
-});
-
-// Добавление ключевого слова через инлайн кнопку
-bot.action('add_keyword_dialog', async (ctx) => {
-    await ctx.answerCbQuery();
-    // Сохраняем состояние пользователя
-    setUserState(ctx.from.id, { waitingForKeyword: true });
-    await ctx.reply('Введите ключевое слово для добавления:');
-});
-
-// Обработка инлайн-кнопок для удаления групп
-const groupRemovePattern = /remove_group_(\d+)/;
-bot.action(groupRemovePattern, async (ctx) => {
-    const match = ctx.callbackQuery.data.match(groupRemovePattern);
-    if (!match) return await ctx.answerCbQuery('Ошибка!');
-
-    const groupIndex = parseInt(match[1]);
-
-    if (isNaN(groupIndex) || groupIndex < 0 || groupIndex >= config.monitoredGroups.length) {
-        return await ctx.answerCbQuery('Некорректный номер группы!');
-    }
-
-    const removedGroup = config.monitoredGroups[groupIndex];
-    config.monitoredGroups.splice(groupIndex, 1);
-    await saveConfig();
-
-    // Удаляем запись о последнем сообщении
-    await LastMessage.deleteOne({ groupId: removedGroup });
-
-    await ctx.answerCbQuery(`Группа ${removedGroup} удалена!`);
-
-    // Обновляем сообщение
-    if (config.monitoredGroups.length === 0) {
-        await ctx.editMessageText('📋 Список групп для мониторинга пуст.');
-    } else {
         let message = '📋 Группы для мониторинга:\n';
         const buttons = [];
 
@@ -987,32 +1020,59 @@ bot.action(groupRemovePattern, async (ctx) => {
             [Markup.button.callback('➕ Добавить новую группу', 'add_group_dialog')]
         ]);
 
-        await ctx.editMessageText(message, inlineKeyboard);
+        await safeSendMessage(ctx.chat.id, message, inlineKeyboard);
+    } catch (error) {
+        console.error('Ошибка при отображении списка групп:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении списка групп.');
     }
 });
 
-// Обработка инлайн-кнопок для удаления ключевых слов
-const keywordRemovePattern = /remove_keyword_(\d+)/;
-bot.action(keywordRemovePattern, async (ctx) => {
-    const match = ctx.callbackQuery.data.match(keywordRemovePattern);
-    if (!match) return await ctx.answerCbQuery('Ошибка!');
-
-    const keywordIndex = parseInt(match[1]);
-
-    if (isNaN(keywordIndex) || keywordIndex < 0 || keywordIndex >= config.keywords.length) {
-        return await ctx.answerCbQuery('Некорректный номер ключевого слова!');
+bot.hears('➕ Добавить группу', async (ctx) => {
+    try {
+        ctx.replyWithChatAction('typing');
+        await safeSendMessage(
+            ctx.chat.id,
+            '➕ Чтобы добавить группу, отправьте команду в формате:\n' +
+            '/add_group @channel_name\n' +
+            'или\n' +
+            '/add_group https://t.me/channel_name'
+        );
+    } catch (error) {
+        console.error('Ошибка при отображении информации о добавлении группы:', error);
     }
+});
 
-    const removedKeyword = config.keywords[keywordIndex];
-    config.keywords.splice(keywordIndex, 1);
-    await saveConfig();
+// Остальные обработчики и логика будут добавлены в следующем фрагменте
+bot.hears('➖ Удалить группу', async (ctx) => {
+    try {
+        ctx.replyWithChatAction('typing');
+        if (config.monitoredGroups.length === 0) {
+            return safeSendMessage(ctx.chat.id, '📋 Список групп для мониторинга пуст.');
+        }
 
-    await ctx.answerCbQuery(`Ключевое слово '${removedKeyword}' удалено!`);
+        let message = '➖ Выберите группу для удаления:\n';
+        const buttons = [];
 
-    // Обновляем сообщение
-    if (config.keywords.length === 0) {
-        await ctx.editMessageText('📝 Список ключевых слов для мониторинга пуст.');
-    } else {
+        config.monitoredGroups.forEach((group, index) => {
+            message += `${index + 1}. ${group}\n`;
+            buttons.push([Markup.button.callback(`❌ ${index + 1}. ${group}`, `remove_group_${index}`)]);
+        });
+
+        await safeSendMessage(ctx.chat.id, message, Markup.inlineKeyboard(buttons));
+    } catch (error) {
+        console.error('Ошибка при отображении списка групп для удаления:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении списка групп для удаления.');
+    }
+});
+
+// Обработка кнопок для работы с ключевыми словами
+bot.hears('📝 Список ключевых слов', async (ctx) => {
+    try {
+        ctx.replyWithChatAction('typing');
+        if (config.keywords.length === 0) {
+            return safeSendMessage(ctx.chat.id, '📝 Список ключевых слов для мониторинга пуст.');
+        }
+
         let message = '📝 Ключевые слова для мониторинга:\n';
         const buttons = [];
 
@@ -1026,66 +1086,88 @@ bot.action(keywordRemovePattern, async (ctx) => {
             [Markup.button.callback('➕ Добавить новое слово', 'add_keyword_dialog')]
         ]);
 
-        await ctx.editMessageText(message, inlineKeyboard);
+        await safeSendMessage(ctx.chat.id, message, inlineKeyboard);
+    } catch (error) {
+        console.error('Ошибка при отображении списка ключевых слов:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении списка ключевых слов.');
     }
 });
 
-// Обработка установки интервала через инлайн-кнопки
-const intervalPattern = /set_interval_(\d+)/;
-bot.action(intervalPattern, async (ctx) => {
-    const match = ctx.callbackQuery.data.match(intervalPattern);
-    if (!match) return await ctx.answerCbQuery('Ошибка!');
-
-    const newInterval = parseInt(match[1]);
-
-    if (isNaN(newInterval) || newInterval < 1) {
-        return await ctx.answerCbQuery('Некорректный интервал!');
+bot.hears('➕ Добавить ключевое слово', async (ctx) => {
+    try {
+        ctx.replyWithChatAction('typing');
+        await safeSendMessage(
+            ctx.chat.id,
+            '➕ Чтобы добавить ключевое слово, отправьте команду в формате:\n' +
+            '/add_keyword javascript\n\n' +
+            'Вы можете добавить несколько слов, разделив их запятыми:\n' +
+            '/add_keyword javascript, python, telegram'
+        );
+    } catch (error) {
+        console.error('Ошибка при отображении информации о добавлении ключевых слов:', error);
     }
-
-    config.checkInterval = newInterval;
-    await saveConfig();
-
-    // Если мониторинг активен, перезапускаем с новым интервалом
-    if (isMonitoringActive && monitoringInterval) {
-        clearInterval(monitoringInterval);
-        monitoringInterval = setInterval(async () => {
-            await checkNewMessages().catch(console.error);
-        }, config.checkInterval * 60 * 1000);
-    }
-
-    await ctx.answerCbQuery(`Интервал установлен на ${newInterval} минут!`);
-    await ctx.editMessageText(`⏱️ Интервал проверки установлен на ${newInterval} минут.`);
 });
 
-// Обработчики для диалогов добавления ключевых слов комментариев
-bot.action('add_comment_keyword_dialog', async (ctx) => {
-    await ctx.answerCbQuery();
-    setUserState(ctx.from.id, { waitingForCommentKeyword: true });
-    await ctx.reply('Введите ключевое слово для добавления в список комментариев:');
+bot.hears('➖ Удалить ключевое слово', async (ctx) => {
+    try {
+        ctx.replyWithChatAction('typing');
+        if (config.keywords.length === 0) {
+            return safeSendMessage(ctx.chat.id, '📝 Список ключевых слов для мониторинга пуст.');
+        }
+
+        let message = '➖ Выберите ключевое слово для удаления:\n';
+        const buttons = [];
+
+        config.keywords.forEach((keyword, index) => {
+            message += `${index + 1}. ${keyword}\n`;
+            buttons.push([Markup.button.callback(`❌ ${index + 1}. ${keyword}`, `remove_keyword_${index}`)]);
+        });
+
+        await safeSendMessage(ctx.chat.id, message, Markup.inlineKeyboard(buttons));
+    } catch (error) {
+        console.error('Ошибка при отображении списка ключевых слов для удаления:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении списка ключевых слов для удаления.');
+    }
 });
 
-// Обработчики для удаления ключевых слов комментариев
-const commentKeywordRemovePattern = /remove_comment_keyword_(\d+)/;
-bot.action(commentKeywordRemovePattern, async (ctx) => {
-    const match = ctx.callbackQuery.data.match(commentKeywordRemovePattern);
-    if (!match) return await ctx.answerCbQuery('Ошибка!');
+// Обработка кнопок настроек
+bot.hears('⏱️ Установить интервал', async (ctx) => {
+    try {
+        ctx.replyWithChatAction('typing');
+        const buttons = [
+            [
+                Markup.button.callback('1 минута', 'set_interval_1'),
+                Markup.button.callback('5 минут', 'set_interval_5'),
+                Markup.button.callback('10 минут', 'set_interval_10')
+            ],
+            [
+                Markup.button.callback('15 минут', 'set_interval_15'),
+                Markup.button.callback('30 минут', 'set_interval_30'),
+                Markup.button.callback('1 час', 'set_interval_60')
+            ]
+        ];
 
-    const keywordIndex = parseInt(match[1]);
-
-    if (isNaN(keywordIndex) || keywordIndex < 0 || keywordIndex >= config.commentKeywords.length) {
-        return await ctx.answerCbQuery('Некорректный номер ключевого слова!');
+        await safeSendMessage(
+            ctx.chat.id,
+            `⏱️ Текущий интервал проверки: ${config.checkInterval} минут\n\n` +
+            'Выберите новый интервал или введите команду:\n' +
+            '/set_interval [минуты]',
+            Markup.inlineKeyboard(buttons)
+        );
+    } catch (error) {
+        console.error('Ошибка при отображении настроек интервала:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении настроек интервала.');
     }
+});
 
-    const removedKeyword = config.commentKeywords[keywordIndex];
-    config.commentKeywords.splice(keywordIndex, 1);
-    await saveConfig();
+// Обработчики для новых пунктов меню
+bot.hears('📝 Список ключевых слов комментариев', async (ctx) => {
+    try {
+        ctx.replyWithChatAction('typing');
+        if (config.commentKeywords.length === 0) {
+            return safeSendMessage(ctx.chat.id, '📝 Список ключевых слов для комментариев пуст.');
+        }
 
-    await ctx.answerCbQuery(`Ключевое слово '${removedKeyword}' удалено из списка комментариев!`);
-
-    // Обновляем сообщение
-    if (config.commentKeywords.length === 0) {
-        await ctx.editMessageText('📝 Список ключевых слов для комментариев пуст.');
-    } else {
         let message = '📝 Ключевые слова для комментариев:\n';
         const buttons = [];
 
@@ -1099,70 +1181,361 @@ bot.action(commentKeywordRemovePattern, async (ctx) => {
             [Markup.button.callback('➕ Добавить новое слово', 'add_comment_keyword_dialog')]
         ]);
 
-        await ctx.editMessageText(message, inlineKeyboard);
+        await safeSendMessage(ctx.chat.id, message, inlineKeyboard);
+    } catch (error) {
+        console.error('Ошибка при отображении списка ключевых слов для комментариев:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении списка ключевых слов для комментариев.');
+    }
+});
+
+bot.hears('➕ Добавить ключевое слово комментариев', async (ctx) => {
+    try {
+        ctx.replyWithChatAction('typing');
+        await safeSendMessage(
+            ctx.chat.id,
+            '➕ Чтобы добавить ключевое слово для комментариев, отправьте команду в формате:\n' +
+            '/add_comment_keyword javascript\n\n' +
+            'Вы можете добавить несколько слов, разделив их запятыми:\n' +
+            '/add_comment_keyword javascript, python, telegram'
+        );
+    } catch (error) {
+        console.error('Ошибка при отображении информации о добавлении ключевых слов для комментариев:', error);
+    }
+});
+
+bot.hears('➖ Удалить ключевое слово комментариев', async (ctx) => {
+    try {
+        ctx.replyWithChatAction('typing');
+        if (config.commentKeywords.length === 0) {
+            return safeSendMessage(ctx.chat.id, '📝 Список ключевых слов для комментариев пуст.');
+        }
+
+        let message = '➖ Выберите ключевое слово для удаления из списка комментариев:\n';
+        const buttons = [];
+
+        config.commentKeywords.forEach((keyword, index) => {
+            message += `${index + 1}. ${keyword}\n`;
+            buttons.push([Markup.button.callback(`❌ ${index + 1}. ${keyword}`, `remove_comment_keyword_${index}`)]);
+        });
+
+        await safeSendMessage(ctx.chat.id, message, Markup.inlineKeyboard(buttons));
+    } catch (error) {
+        console.error('Ошибка при отображении списка ключевых слов комментариев для удаления:', error);
+    }
+});
+
+// Обработка нажатий на инлайн-кнопки
+bot.action('start_monitoring', async (ctx) => {
+    try {
+        await ctx.answerCbQuery('Запускаю мониторинг...');
+        const result = await startMonitoring();
+        await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n' + result);
+        // Обновляем кнопки
+        await ctx.editMessageReplyMarkup(Markup.inlineKeyboard([
+            Markup.button.callback('⏹️ Остановить мониторинг', 'stop_monitoring'),
+            Markup.button.callback('🔄 Проверить сейчас', 'check_now')
+        ]).reply_markup);
+    } catch (error) {
+        console.error('Ошибка при запуске мониторинга через инлайн-кнопку:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при запуске мониторинга.');
+    }
+});
+
+bot.action('stop_monitoring', async (ctx) => {
+    try {
+        await ctx.answerCbQuery('Останавливаю мониторинг...');
+        const result = stopMonitoring();
+        await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n' + result);
+        // Обновляем кнопки
+        await ctx.editMessageReplyMarkup(Markup.inlineKeyboard([
+            Markup.button.callback('▶️ Запустить мониторинг', 'start_monitoring'),
+            Markup.button.callback('🔄 Проверить сейчас', 'check_now')
+        ]).reply_markup);
+    } catch (error) {
+        console.error('Ошибка при остановке мониторинга через инлайн-кнопку:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при остановке мониторинга.');
+    }
+});
+
+bot.action('check_now', async (ctx) => {
+    try {
+        await ctx.answerCbQuery('Проверяю новые сообщения...');
+        await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n🔄 Проверяю новые сообщения...');
+        await checkNewMessages().catch(console.error);
+        await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n✅ Проверка завершена!');
+    } catch (error) {
+        console.error('Ошибка при проверке сообщений через инлайн-кнопку:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при проверке сообщений.');
+    }
+});
+
+// Добавление группы через инлайн кнопку
+bot.action('add_group_dialog', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        // Сохраняем состояние пользователя
+        setUserState(ctx.from.id, { waitingForGroup: true });
+        await safeSendMessage(ctx.chat.id, 'Отправьте ссылку на группу или канал (например, @channel_name или https://t.me/channel_name):');
+    } catch (error) {
+        console.error('Ошибка при открытии диалога добавления группы:', error);
+    }
+});
+
+// Добавление ключевого слова через инлайн кнопку
+bot.action('add_keyword_dialog', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        // Сохраняем состояние пользователя
+        setUserState(ctx.from.id, { waitingForKeyword: true });
+        await safeSendMessage(ctx.chat.id, 'Введите ключевое слово для добавления:');
+    } catch (error) {
+        console.error('Ошибка при открытии диалога добавления ключевого слова:', error);
+    }
+});
+
+// Обработка инлайн-кнопок для удаления групп
+const groupRemovePattern = /remove_group_(\d+)/;
+bot.action(groupRemovePattern, async (ctx) => {
+    try {
+        const match = ctx.callbackQuery.data.match(groupRemovePattern);
+        if (!match) return await ctx.answerCbQuery('Ошибка!');
+
+        const groupIndex = parseInt(match[1]);
+
+        if (isNaN(groupIndex) || groupIndex < 0 || groupIndex >= config.monitoredGroups.length) {
+            return await ctx.answerCbQuery('Некорректный номер группы!');
+        }
+
+        const removedGroup = config.monitoredGroups[groupIndex];
+        config.monitoredGroups.splice(groupIndex, 1);
+        await saveConfig();
+
+        // Удаляем запись о последнем сообщении
+        await LastMessage.deleteOne({ groupId: removedGroup });
+
+        await ctx.answerCbQuery(`Группа ${removedGroup} удалена!`);
+
+        // Обновляем сообщение
+        if (config.monitoredGroups.length === 0) {
+            await ctx.editMessageText('📋 Список групп для мониторинга пуст.');
+        } else {
+            let message = '📋 Группы для мониторинга:\n';
+            const buttons = [];
+
+            config.monitoredGroups.forEach((group, index) => {
+                message += `${index + 1}. ${group}\n`;
+                buttons.push([Markup.button.callback(`❌ Удалить ${index + 1}`, `remove_group_${index}`)]);
+            });
+
+            const inlineKeyboard = Markup.inlineKeyboard([
+                ...buttons,
+                [Markup.button.callback('➕ Добавить новую группу', 'add_group_dialog')]
+            ]);
+
+            await ctx.editMessageText(message, inlineKeyboard);
+        }
+    } catch (error) {
+        console.error('Ошибка при удалении группы через инлайн-кнопку:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при удалении группы.');
+    }
+});
+
+// Обработка инлайн-кнопок для удаления ключевых слов
+const keywordRemovePattern = /remove_keyword_(\d+)/;
+bot.action(keywordRemovePattern, async (ctx) => {
+    try {
+        const match = ctx.callbackQuery.data.match(keywordRemovePattern);
+        if (!match) return await ctx.answerCbQuery('Ошибка!');
+
+        const keywordIndex = parseInt(match[1]);
+
+        if (isNaN(keywordIndex) || keywordIndex < 0 || keywordIndex >= config.keywords.length) {
+            return await ctx.answerCbQuery('Некорректный номер ключевого слова!');
+        }
+
+        const removedKeyword = config.keywords[keywordIndex];
+        config.keywords.splice(keywordIndex, 1);
+        await saveConfig();
+
+        await ctx.answerCbQuery(`Ключевое слово '${removedKeyword}' удалено!`);
+
+        // Обновляем сообщение
+        if (config.keywords.length === 0) {
+            await ctx.editMessageText('📝 Список ключевых слов для мониторинга пуст.');
+        } else {
+            let message = '📝 Ключевые слова для мониторинга:\n';
+            const buttons = [];
+
+            config.keywords.forEach((keyword, index) => {
+                message += `${index + 1}. ${keyword}\n`;
+                buttons.push([Markup.button.callback(`❌ Удалить ${index + 1}`, `remove_keyword_${index}`)]);
+            });
+
+            const inlineKeyboard = Markup.inlineKeyboard([
+                ...buttons,
+                [Markup.button.callback('➕ Добавить новое слово', 'add_keyword_dialog')]
+            ]);
+
+            await ctx.editMessageText(message, inlineKeyboard);
+        }
+    } catch (error) {
+        console.error('Ошибка при удалении ключевого слова через инлайн-кнопку:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при удалении ключевого слова.');
+    }
+});
+
+// Обработка установки интервала через инлайн-кнопки
+const intervalPattern = /set_interval_(\d+)/;
+bot.action(intervalPattern, async (ctx) => {
+    try {
+        const match = ctx.callbackQuery.data.match(intervalPattern);
+        if (!match) return await ctx.answerCbQuery('Ошибка!');
+
+        const newInterval = parseInt(match[1]);
+
+        if (isNaN(newInterval) || newInterval < 1) {
+            return await ctx.answerCbQuery('Некорректный интервал!');
+        }
+
+        config.checkInterval = newInterval;
+        await saveConfig();
+
+        // Если мониторинг активен, перезапускаем с новым интервалом
+        if (isMonitoringActive && monitoringInterval) {
+            clearInterval(monitoringInterval);
+            monitoringInterval = setInterval(async () => {
+                await checkNewMessages().catch(console.error);
+            }, config.checkInterval * 60 * 1000);
+        }
+
+        await ctx.answerCbQuery(`Интервал установлен на ${newInterval} минут!`);
+        await ctx.editMessageText(`⏱️ Интервал проверки установлен на ${newInterval} минут.`);
+    } catch (error) {
+        console.error('Ошибка при установке интервала через инлайн-кнопку:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при установке интервала.');
+    }
+});
+
+// Обработчики для диалогов добавления ключевых слов комментариев
+bot.action('add_comment_keyword_dialog', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        setUserState(ctx.from.id, { waitingForCommentKeyword: true });
+        await safeSendMessage(ctx.chat.id, 'Введите ключевое слово для добавления в список комментариев:');
+    } catch (error) {
+        console.error('Ошибка при открытии диалога добавления ключевого слова для комментариев:', error);
+    }
+});
+
+// Обработчики для удаления ключевых слов комментариев
+const commentKeywordRemovePattern = /remove_comment_keyword_(\d+)/;
+bot.action(commentKeywordRemovePattern, async (ctx) => {
+    try {
+        const match = ctx.callbackQuery.data.match(commentKeywordRemovePattern);
+        if (!match) return await ctx.answerCbQuery('Ошибка!');
+
+        const keywordIndex = parseInt(match[1]);
+
+        if (isNaN(keywordIndex) || keywordIndex < 0 || keywordIndex >= config.commentKeywords.length) {
+            return await ctx.answerCbQuery('Некорректный номер ключевого слова!');
+        }
+
+        const removedKeyword = config.commentKeywords[keywordIndex];
+        config.commentKeywords.splice(keywordIndex, 1);
+        await saveConfig();
+
+        await ctx.answerCbQuery(`Ключевое слово '${removedKeyword}' удалено из списка комментариев!`);
+
+        // Обновляем сообщение
+        if (config.commentKeywords.length === 0) {
+            await ctx.editMessageText('📝 Список ключевых слов для комментариев пуст.');
+        } else {
+            let message = '📝 Ключевые слова для комментариев:\n';
+            const buttons = [];
+
+            config.commentKeywords.forEach((keyword, index) => {
+                message += `${index + 1}. ${keyword}\n`;
+                buttons.push([Markup.button.callback(`❌ Удалить ${index + 1}`, `remove_comment_keyword_${index}`)]);
+            });
+
+            const inlineKeyboard = Markup.inlineKeyboard([
+                ...buttons,
+                [Markup.button.callback('➕ Добавить новое слово', 'add_comment_keyword_dialog')]
+            ]);
+
+            await ctx.editMessageText(message, inlineKeyboard);
+        }
+    } catch (error) {
+        console.error('Ошибка при удалении ключевого слова для комментариев через инлайн-кнопку:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при удалении ключевого слова для комментариев.');
     }
 });
 
 // Обработка текстовых сообщений для добавления групп и ключевых слов
 bot.on('text', async (ctx) => {
-    // Получаем текущее состояние пользователя
-    const state = getUserState(ctx.from.id);
+    try {
+        // Получаем текущее состояние пользователя
+        const state = getUserState(ctx.from.id);
 
-    // Проверяем, находимся ли мы в режиме ожидания ввода группы
-    if (state.waitingForGroup) {
-        const newGroup = ctx.message.text.trim();
+        // Проверяем, находимся ли мы в режиме ожидания ввода группы
+        if (state.waitingForGroup) {
+            const newGroup = ctx.message.text.trim();
 
-        if (!config.monitoredGroups.includes(newGroup)) {
-            config.monitoredGroups.push(newGroup);
-            // Создаем запись для отслеживания последнего сообщения
-            await LastMessage.findOneAndUpdate(
-                { groupId: newGroup },
-                { lastMessageId: 0 },
-                { upsert: true }
-            );
-            await saveConfig();
-            ctx.reply(`✅ Группа ${newGroup} добавлена в список мониторинга.`);
-        } else {
-            ctx.reply(`⚠️ Группа ${newGroup} уже есть в списке мониторинга.`);
+            if (!config.monitoredGroups.includes(newGroup)) {
+                config.monitoredGroups.push(newGroup);
+                // Создаем запись для отслеживания последнего сообщения
+                await LastMessage.findOneAndUpdate(
+                    { groupId: newGroup },
+                    { lastMessageId: 0 },
+                    { upsert: true }
+                );
+                await saveConfig();
+                await safeSendMessage(ctx.chat.id, `✅ Группа ${newGroup} добавлена в список мониторинга.`);
+            } else {
+                await safeSendMessage(ctx.chat.id, `⚠️ Группа ${newGroup} уже есть в списке мониторинга.`);
+            }
+
+            // Сбрасываем состояние ожидания
+            setUserState(ctx.from.id, {});
+            return;
         }
 
-        // Сбрасываем состояние ожидания
-        setUserState(ctx.from.id, {});
-        return;
-    }
+        // Проверяем, находимся ли мы в режиме ожидания ввода ключевого слова
+        if (state.waitingForKeyword) {
+            const newKeyword = ctx.message.text.trim();
 
-    // Проверяем, находимся ли мы в режиме ожидания ввода ключевого слова
-    if (state.waitingForKeyword) {
-        const newKeyword = ctx.message.text.trim();
+            if (!config.keywords.includes(newKeyword)) {
+                config.keywords.push(newKeyword);
+                await saveConfig();
+                await safeSendMessage(ctx.chat.id, `✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга.`);
+            } else {
+                await safeSendMessage(ctx.chat.id, `⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга.`);
+            }
 
-        if (!config.keywords.includes(newKeyword)) {
-            config.keywords.push(newKeyword);
-            await saveConfig();
-            ctx.reply(`✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга.`);
-        } else {
-            ctx.reply(`⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга.`);
+            // Сбрасываем состояние ожидания
+            setUserState(ctx.from.id, {});
+            return;
         }
 
-        // Сбрасываем состояние ожидания
-        setUserState(ctx.from.id, {});
-        return;
-    }
+        // Проверяем, находимся ли мы в режиме ожидания ввода ключевого слова для комментариев
+        if (state.waitingForCommentKeyword) {
+            const newKeyword = ctx.message.text.trim();
 
-    // Проверяем, находимся ли мы в режиме ожидания ввода ключевого слова для комментариев
-    if (state.waitingForCommentKeyword) {
-        const newKeyword = ctx.message.text.trim();
+            if (!config.commentKeywords.includes(newKeyword)) {
+                config.commentKeywords.push(newKeyword);
+                await saveConfig();
+                await safeSendMessage(ctx.chat.id, `✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга комментариев.`);
+            } else {
+                await safeSendMessage(ctx.chat.id, `⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга комментариев.`);
+            }
 
-        if (!config.commentKeywords.includes(newKeyword)) {
-            config.commentKeywords.push(newKeyword);
-            await saveConfig();
-            ctx.reply(`✅ Ключевое слово '${newKeyword}' добавлено в список мониторинга комментариев.`);
-        } else {
-            ctx.reply(`⚠️ Ключевое слово '${newKeyword}' уже есть в списке мониторинга комментариев.`);
+            // Сбрасываем состояние ожидания
+            setUserState(ctx.from.id, {});
+            return;
         }
-
-        // Сбрасываем состояние ожидания
-        setUserState(ctx.from.id, {});
-        return;
+    } catch (error) {
+        console.error('Ошибка при обработке текстового сообщения:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при обработке сообщения.');
     }
 });
 
@@ -1221,6 +1594,29 @@ async function migrateFromJson() {
     }
 }
 
+// Функция для сброса счетчиков последних сообщений
+async function resetLastMessageIds() {
+    try {
+        await LastMessage.updateMany({}, { lastMessageId: 0 });
+        console.log('Счетчики последних сообщений сброшены');
+        return true;
+    } catch (error) {
+        console.error('Ошибка при сбросе счетчиков последних сообщений:', error);
+        return false;
+    }
+}
+
+// Команда для сброса счетчиков последних сообщений
+bot.command('reset_counters', async (ctx) => {
+    try {
+        await resetLastMessageIds();
+        await safeSendMessage(ctx.chat.id, '✅ Счетчики последних сообщений сброшены. При следующей проверке будут просканированы все сообщения.');
+    } catch (error) {
+        console.error('Ошибка при выполнении команды reset_counters:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при сбросе счетчиков.');
+    }
+});
+
 // Главная функция для запуска приложения
 async function main() {
     console.log('Запуск приложения...');
@@ -1254,7 +1650,7 @@ async function main() {
 
     // Отправляем сообщение, что бот запустился
     try {
-        await bot.telegram.sendMessage(
+        await safeSendMessage(
             TARGET_GROUP,
             '🤖 Бот мониторинга запущен и готов к работе!\n' +
             'Используйте команду /start для получения списка доступных команд.',
