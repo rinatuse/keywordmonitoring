@@ -306,7 +306,7 @@ async function checkCommentsWithTimeout(message, group, entity) {
                     // Получаем комментарии к посту с ограничением
                     const comments = await client.getMessages(entity, {
                         replyTo: message.id,
-                        limit: 20 // Уменьшаем количество проверяемых комментариев
+                        limit: config.messageLimit || 20 // Уменьшаем количество проверяемых комментариев
                     });
 
                     // Задержка после получения комментариев
@@ -549,7 +549,7 @@ async function checkGroupMessages(group) {
         const lastMessageId = lastMessageData.lastMessageId;
 
         // Получаем последние сообщения с защитой от таймаута
-        const messages = await getMessagesWithTimeout(entity, { limit: 20 }, 30000);
+        const messages = await getMessagesWithTimeout(entity, { limit: config.messageLimit || 20 }, 30000);
 
         if (messages.length === 0) {
             console.log(`Не удалось получить сообщения для группы ${group} или группа пуста`);
@@ -658,7 +658,7 @@ async function checkCommentsWithSafetyTimeout(message, group, entity) {
         // Получаем комментарии с защитой от таймаута
         const comments = await getMessagesWithTimeout(
             entity,
-            { replyTo: message.id, limit: 50 },
+            { replyTo: message.id, limit: config.messageLimit || 50 },
             30000 // 30 секунд на получение комментариев
         );
 
@@ -771,6 +771,7 @@ const keywordsMenuKeyboard = Markup.keyboard([
 
 const settingsMenuKeyboard = Markup.keyboard([
     ['⏱️ Установить интервал'],
+    ['📄 Установить лимит сообщений'],
     ['🔙 Назад в главное меню']
 ]).resize();
 
@@ -1160,6 +1161,34 @@ bot.hears('🔙 Назад в главное меню', async (ctx) => {
     }
 });
 
+// Обработчик кнопки "Установить лимит сообщений"
+bot.hears('📄 Установить лимит сообщений', async (ctx) => {
+    try {
+        const buttons = [
+            [
+                Markup.button.callback('10 сообщений', 'set_limit_10'),
+                Markup.button.callback('20 сообщений', 'set_limit_20'),
+                Markup.button.callback('30 сообщений', 'set_limit_30')
+            ],
+            [
+                Markup.button.callback('50 сообщений', 'set_limit_50'),
+                Markup.button.callback('100 сообщений', 'set_limit_100')
+            ]
+        ];
+
+        await safeSendMessage(
+            ctx.chat.id,
+            `📄 Текущий лимит сообщений: ${config.messageLimit || 20}\n\n` +
+            'Выберите новый лимит сообщений или введите команду:\n' +
+            '/set_message_limit [число]',
+            Markup.inlineKeyboard(buttons)
+        );
+    } catch (error) {
+        console.error('Ошибка при отображении настроек лимита сообщений:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении настроек лимита сообщений.');
+    }
+});
+
 bot.hears('📊 Статус', async (ctx) => {
     try {
         ctx.replyWithChatAction('typing');
@@ -1502,6 +1531,30 @@ bot.action('start_monitoring', async (ctx) => {
     } catch (error) {
         console.error('Ошибка при запуске мониторинга через инлайн-кнопку:', error);
         await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при запуске мониторинга.');
+    }
+});
+
+// Обработка установки лимита сообщений через инлайн-кнопки
+const limitPattern = /set_limit_(\d+)/;
+bot.action(limitPattern, async (ctx) => {
+    try {
+        const match = ctx.callbackQuery.data.match(limitPattern);
+        if (!match) return await ctx.answerCbQuery('Ошибка!');
+
+        const newLimit = parseInt(match[1]);
+
+        if (isNaN(newLimit) || newLimit < 1) {
+            return await ctx.answerCbQuery('Некорректный лимит!');
+        }
+
+        config.messageLimit = newLimit;
+        await saveConfig();
+
+        await ctx.answerCbQuery(`Лимит сообщений установлен на ${newLimit}!`);
+        await ctx.editMessageText(`📄 Лимит сообщений установлен на ${newLimit}.`);
+    } catch (error) {
+        console.error('Ошибка при установке лимита сообщений через инлайн-кнопку:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при установке лимита сообщений.');
     }
 });
 
@@ -1892,6 +1945,30 @@ bot.command('reset_counters', async (ctx) => {
     } catch (error) {
         console.error('Ошибка при выполнении команды reset_counters:', error);
         await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при сбросе счетчиков.');
+    }
+});
+
+// Команда для установки лимита сообщений
+bot.command('set_message_limit', async (ctx) => {
+    try {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return safeSendMessage(ctx.chat.id, '⚠️ Пожалуйста, укажите лимит сообщений.\nПример: /set_message_limit 50');
+        }
+
+        const newLimit = parseInt(args[1]);
+
+        if (isNaN(newLimit) || newLimit < 1) {
+            return safeSendMessage(ctx.chat.id, '⚠️ Некорректный лимит. Введите число больше 0.');
+        }
+
+        config.messageLimit = newLimit;
+        await saveConfig();
+
+        await safeSendMessage(ctx.chat.id, `📄 Лимит сообщений установлен на ${newLimit}.`);
+    } catch (error) {
+        console.error('Ошибка при установке лимита сообщений:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при установке лимита сообщений.');
     }
 });
 

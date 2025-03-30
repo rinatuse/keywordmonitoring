@@ -5,7 +5,8 @@ const ConfigSchema = new mongoose.Schema({
     monitoredGroups: [String],
     keywords: [String],
     commentKeywords: [String],
-    checkInterval: { type: Number, default: 5 }
+    checkInterval: { type: Number, default: 5 },
+    messageLimit: { type: Number, default: 20 }
 });
 
 // Схема для последних сообщений
