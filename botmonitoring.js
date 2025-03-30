@@ -234,10 +234,9 @@ async function sendPendingMatches() {
             } else {
                 // Если много совпадений, группируем их
                 let message = `🔍 Найдено ${matches.length} совпадений ключевых слов в группе ${group}:\n\n`;
-                for (let i = 0; i < Math.min(matches.length, 10); i++) {
+                for (let i = 0; i < matches.length; i++) {
                     message += `${i + 1}. '${matches[i].keyword}' - ${matches[i].messageLink}\n`;
                 }
-                message += matches.length > 10 ? `\n... и еще ${matches.length - 10} совпадений.` : '';
                 await safeSendMessage(TARGET_GROUP, message);
             }
         }
@@ -273,10 +272,9 @@ async function sendPendingMatches() {
             } else {
                 // Если много совпадений, группируем их
                 let message = `🔍 Найдено ${matches.length} совпадений ключевых слов в комментариях группы ${group}:\n\n`;
-                for (let i = 0; i < Math.min(matches.length, 10); i++) {
+                for (let i = 0; i < matches.length; i++) {
                     message += `${i + 1}. '${matches[i].keyword}' - ${matches[i].commentLink}\n`;
                 }
-                message += matches.length > 10 ? `\n... и еще ${matches.length - 10} совпадений.` : '';
                 await safeSendMessage(TARGET_GROUP, message);
             }
         }
