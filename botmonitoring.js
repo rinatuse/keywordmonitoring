@@ -4,6 +4,7 @@ const { Telegraf, Markup } = require('telegraf');
 const fs = require('fs');
 const input = require('input');
 const mongoose = require('mongoose');
+const { Api } = require('telegram');
 
 
 
@@ -712,6 +713,83 @@ async function checkCommentsWithSafetyTimeout(message, group, entity) {
     }
 }
 
+// Функция для получения ID канала по ссылке-приглашению
+async function getChannelIdByInviteLink(inviteLink) {
+    try {
+        // Извлекаем хэш приглашения из ссылки
+        let inviteHash = '';
+        if (inviteLink.includes('/+')) {
+            inviteHash = inviteLink.split('/+')[1];
+        } else if (inviteLink.includes('/joinchat/')) {
+            inviteHash = inviteLink.split('/joinchat/')[1];
+        } else {
+            throw new Error('Неверный формат ссылки-приглашения');
+        }
+
+        // Используем метод checkChatInvite для получения информации о канале
+        const chatInvite = await client.invoke(
+            new Api.messages.CheckChatInvite({
+                hash: inviteHash
+            })
+        );
+
+        // Если уже участник, получаем информацию о канале
+        if (chatInvite.chat) {
+            const id = chatInvite.chat.id;
+
+            if (chatInvite.chat._ === 'channel' || chatInvite.chat._ === 'channelForbidden' || chatInvite.chat.megagroup === true) {
+                return `-100${Math.abs(id)}`
+            }
+            return id.toString();
+        } else {
+            // Если не участник, сначала нужно присоединиться
+            const updates = await client.invoke(
+                new Api.messages.ImportChatInvite({
+                    hash: inviteHash
+                })
+            );
+
+            // Извлекаем ID из результата присоединения
+            if (updates.chats && updates.chats.length > 0) {
+                return updates.chats[0].id.toString();
+            }
+        }
+
+        throw new Error('Не удалось получить ID канала');
+    } catch (error) {
+        console.error('Ошибка при получении ID канала:', error);
+        throw error;
+    }
+}
+
+// Функция для проверки каналов, в которых бот является участником
+async function getChannelIdIfMember(channelLink) {
+    try {
+        // Если это обычная ссылка на канал (не приглашение)
+        if (channelLink.startsWith('@') || channelLink.includes('t.me/') && !channelLink.includes('/+') && !channelLink.includes('/joinchat/')) {
+            // Получаем имя канала из ссылки
+            const channelName = getChannelNameFromLink(channelLink);
+
+            // Получаем информацию о канале
+            const entity = await client.getEntity(channelName);
+            return entity.id.toString();
+        }
+        // Если это ссылка-приглашение
+        else if (channelLink.includes('/+') || channelLink.includes('/joinchat/')) {
+            return await getChannelIdByInviteLink(channelLink);
+        }
+        // Если это уже ID канала
+        else if (channelLink.startsWith('-100')) {
+            return channelLink;
+        }
+
+        throw new Error('Неподдерживаемый формат ссылки на канал');
+    } catch (error) {
+        console.error('Ошибка при получении ID канала:', error);
+        throw error;
+    }
+}
+
 // Функция для остановки мониторинга
 function stopMonitoring() {
     if (!isMonitoringActive) {
@@ -803,6 +881,24 @@ bot.command('start', (ctx) => {
     ).then(() => {
         showMainMenu(ctx);
     });
+});
+
+// Команда для преобразования ссылки в ID канала
+bot.command('get_channel_id', async (ctx) => {
+    try {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return safeSendMessage(ctx.chat.id, '⚠️ Пожалуйста, укажите ссылку на канал.\nПример: /get_channel_id https://t.me/+abcdefghijkl');
+        }
+
+        const channelLink = args[1];
+        const channelId = await getChannelIdIfMember(channelLink);
+
+        await safeSendMessage(ctx.chat.id, `🆔 ID канала: ${channelId}\n\nВы можете использовать этот ID для добавления в мониторинг: /add_group ${channelId}`);
+    } catch (error) {
+        console.error('Ошибка при получении ID канала:', error);
+        await safeSendMessage(ctx.chat.id, `❌ Ошибка при получении ID канала: ${error.message}`);
+    }
 });
 
 // Команда для запуска мониторинга
