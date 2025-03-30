@@ -23,9 +23,12 @@ const SESSION_FILE = 'session.json';
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // Настройка подключения к MongoDB
-mongoose.connect('mongodb://localhost:27017/telegram_monitor', {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
+const password = encodeURIComponent('34A=C1lt1{QllX'); // Здесь укажите ваш настоящий пароль для пользователя rinat
+mongoose.connect(`mongodb://rinat:${password}@92.53.105.80:27017/telegram_monitor`, {
+    authSource: 'admin',
+    serverSelectionTimeoutMS: 30000,
+    socketTimeoutMS: 45000,
+    connectTimeoutMS: 30000
 }).then(() => {
     console.log('Успешное подключение к MongoDB');
 }).catch((error) => {

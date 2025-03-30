@@ -22,9 +22,12 @@ const LastMessage = mongoose.model('LastMessage', LastMessageSchema);
 // Функция подключения к базе данных
 async function connectToDatabase() {
     try {
-        await mongoose.connect('mongodb://localhost:27017/telegram_monitor', {
-            useNewUrlParser: true,
-            useUnifiedTopology: true
+        const password = encodeURIComponent('34A=C1lt1{QllX'); // Здесь укажите ваш настоящий пароль для пользователя rinat
+        await mongoose.connect(`mongodb://rinat:${password}@92.53.105.80:27017/telegram_monitor`, {
+            authSource: 'admin',
+            serverSelectionTimeoutMS: 30000,
+            socketTimeoutMS: 45000,
+            connectTimeoutMS: 30000
         });
         console.log('Успешное подключение к MongoDB');
         return true;
