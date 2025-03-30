@@ -5,6 +5,7 @@ const fs = require('fs');
 const input = require('input');
 const mongoose = require('mongoose');
 const { Api } = require('telegram');
+const { waitForDebugger } = require('inspector');
 
 
 
@@ -416,15 +417,25 @@ async function checkMessageForKeywords(message, group, entity) {
     }
 }
 
-// Функция для проверки новых сообщений
 
+// Добавляем глобальные переменные для хранения статистики (в начало файла)
+let monitoringStats = {
+    totalChecks: 0,         // Всего проверок
+    messagesProcessed: 0,   // Обработано сообщений
+    matchesFound: 0,        // Найдено совпадений
+    lastCheck: null         // Время последней проверки
+};
+
+// Функция для проверки новых сообщений
 async function checkNewMessages() {
     if (!isMonitoringActive) {
         console.log('Мониторинг остановлен, пропускаем проверку');
-        return;
+        return { totalProcessed: 0, matchesFound: 0 };
     }
 
     console.log('Начинаем проверку...');
+    let totalProcessed = 0;
+    let matchesFound = 0;
 
     try {
         // Очищаем накопленные совпадения
@@ -436,7 +447,13 @@ async function checkNewMessages() {
         // Проверяем каждую группу
         for (const group of config.monitoredGroups) {
             try {
-                await checkGroupMessages(group);
+                const result = await checkGroupMessages(group);
+                if (result && result.processed) {
+                    totalProcessed += result.processed;
+                }
+
+                // Вывод статистики по группе в консоль (можно оставить)
+                console.log(`Проверка группы ${group} завершена. Обработано ${result ? result.processed : 0} новых сообщений.`);
             } catch (error) {
                 console.error(`Ошибка при проверке группы ${group}:`, error);
             }
@@ -445,21 +462,25 @@ async function checkNewMessages() {
             await delay(1000);
         }
 
+        // Считаем общее количество найденных совпадений
+        matchesFound = pendingMatches.keywords.length + pendingMatches.comments.length;
+
         // Отправляем накопленные совпадения
-        if (pendingMatches.keywords.length > 0 || pendingMatches.comments.length > 0) {
+        if (matchesFound > 0) {
             await sendPendingMatches();
         }
 
-        console.log('Проверка завершена.');
-        return true;
+        // Выводим итоговую статистику в консоль
+        console.log(`Проверка завершена. Обработано ${totalProcessed} сообщений, найдено ${matchesFound} совпадений.`);
+
+        return { totalProcessed, matchesFound };
     } catch (error) {
         console.error('Ошибка при выполнении проверки:', error);
-        return false;
+        return { totalProcessed, matchesFound, error: error.message };
     } finally {
         isChecking = false; // Сбрасываем флаг проверки
     }
 }
-
 // Функция для запуска мониторинга
 async function startMonitoring() {
     if (isMonitoringActive) {
@@ -507,9 +528,36 @@ function runCheckProcess() {
     // Запускаем проверку в отдельном процессе
     setTimeout(async () => {
         try {
-            await checkNewMessages().catch(console.error);
+            const result = await checkNewMessages().catch(console.error);
+
+            // Отправляем сообщение со статистикой
+            if (result) {
+                // Правильное склонение слов
+                let msgForm = 'сообщений';
+                if (result.totalProcessed % 10 === 1 && result.totalProcessed % 100 !== 11) {
+                    msgForm = 'сообщение';
+                } else if ([2, 3, 4].includes(result.totalProcessed % 10) &&
+                    ![12, 13, 14].includes(result.totalProcessed % 100)) {
+                    msgForm = 'сообщения';
+                }
+
+                let matchForm = 'совпадений';
+                if (result.matchesFound % 10 === 1 && result.matchesFound % 100 !== 11) {
+                    matchForm = 'совпадение';
+                } else if ([2, 3, 4].includes(result.matchesFound % 10) &&
+                    ![12, 13, 14].includes(result.matchesFound % 100)) {
+                    matchForm = 'совпадения';
+                }
+
+                // Отправляем статистику только при наличии новых сообщений или совпадений
+                if (result.totalProcessed > 0 || result.matchesFound > 0) {
+                    const message = `📊 Статистика проверки:\nОбработано ${result.totalProcessed} ${msgForm}, найдено ${result.matchesFound} ${matchForm}.`;
+                    await safeSendMessage(TARGET_GROUP, message);
+                }
+            }
         } catch (error) {
             console.error('Ошибка при выполнении проверки:', error);
+            await safeSendMessage(TARGET_GROUP, '❌ Произошла ошибка при проверке сообщений.');
         } finally {
             isChecking = false; // Сбрасываем флаг проверки после завершения
         }
@@ -520,9 +568,11 @@ function runCheckProcess() {
 const MAX_MESSAGES_PER_CHECK = 5;
 
 // Функция для проверки новых сообщений (полностью переработанная)
+// Функция для проверки новых сообщений в группе
 async function checkGroupMessages(group) {
     try {
         console.log(`Проверяем группу ${group}...`);
+        let processed = 0;
 
         // Получаем имя канала из ссылки
         const channelName = getChannelNameFromLink(group);
@@ -536,7 +586,7 @@ async function checkGroupMessages(group) {
 
         if (!entity) {
             console.log(`Не удалось получить сущность для группы ${group}, пропускаем`);
-            return false;
+            return { processed: 0 };
         }
 
         // Получаем ID последнего проверенного сообщения из базы данных
@@ -554,7 +604,7 @@ async function checkGroupMessages(group) {
 
         if (messages.length === 0) {
             console.log(`Не удалось получить сообщения для группы ${group} или группа пуста`);
-            return false;
+            return { processed: 0 };
         }
 
         console.log(`Получено ${messages.length} сообщений из ${group}`);
@@ -569,6 +619,8 @@ async function checkGroupMessages(group) {
                 console.log(`Пропускаем сообщение [ID: ${message.id}], т.к. оно уже было проверено (последний ID: ${lastMessageId})`);
                 continue;
             }
+
+            processed++;
 
             // Обновляем ID последнего проверенного сообщения в базе данных
             await LastMessage.findOneAndUpdate(
@@ -587,11 +639,11 @@ async function checkGroupMessages(group) {
             await delay(200);
         }
 
-        console.log(`Проверка группы ${group} завершена.`);
-        return true;
+        console.log(`Проверка группы ${group} завершена. Обработано ${processed} новых сообщений.`);
+        return { processed };
     } catch (error) {
         console.error(`Ошибка при проверке группы ${group}:`, error);
-        return false;
+        return { processed: 0, error: error.message };
     }
 }
 
@@ -835,7 +887,7 @@ const controlMenuKeyboard = Markup.keyboard([
 
 const groupsMenuKeyboard = Markup.keyboard([
     ['📋 Список групп', '➕ Добавить группу'],
-    ['➖ Удалить группу'],
+    ['➖ Удалить группу', '🆔 Получить ID канала'],
     ['🔙 Назад в главное меню']
 ]).resize();
 
@@ -848,8 +900,8 @@ const keywordsMenuKeyboard = Markup.keyboard([
 ]).resize();
 
 const settingsMenuKeyboard = Markup.keyboard([
-    ['⏱️ Установить интервал'],
-    ['📄 Установить лимит сообщений'],
+    ['⏱️ Установить интервал', '📄 Установить лимит сообщений'],
+    ['🔄 Сбросить счетчики', '⚙️ Другие настройки'],
     ['🔙 Назад в главное меню']
 ]).resize();
 
@@ -938,15 +990,47 @@ bot.command('stop_monitoring', async (ctx) => {
     }
 });
 
-// Команда для проверки новых сообщений сейчас
+// Модифицируем обработчик команды /check_now
 bot.command('check_now', async (ctx) => {
     try {
         await safeSendMessage(ctx.chat.id, '🔄 Проверяю новые сообщения...');
-        await checkNewMessages().catch(console.error);
-        await safeSendMessage(ctx.chat.id, '✅ Проверка завершена!');
+
+        if (isChecking) {
+            await safeSendMessage(ctx.chat.id, '⏳ Проверка уже выполняется, пожалуйста, подождите.');
+            return;
+        }
+
+        isChecking = true;
+        const result = await checkNewMessages().catch(console.error);
+
+        if (result) {
+            // Формируем сообщение с результатами
+            let msgForm = 'сообщений';
+            if (result.totalProcessed % 10 === 1 && result.totalProcessed % 100 !== 11) {
+                msgForm = 'сообщение';
+            } else if ([2, 3, 4].includes(result.totalProcessed % 10) &&
+                ![12, 13, 14].includes(result.totalProcessed % 100)) {
+                msgForm = 'сообщения';
+            }
+
+            let matchForm = 'совпадений';
+            if (result.matchesFound % 10 === 1 && result.matchesFound % 100 !== 11) {
+                matchForm = 'совпадение';
+            } else if ([2, 3, 4].includes(result.matchesFound % 10) &&
+                ![12, 13, 14].includes(result.matchesFound % 100)) {
+                matchForm = 'совпадения';
+            }
+
+            const message = `✅ Проверка завершена!\n📊 Обработано ${result.totalProcessed} ${msgForm}, найдено ${result.matchesFound} ${matchForm}.`;
+            await safeSendMessage(ctx.chat.id, message);
+        } else {
+            await safeSendMessage(ctx.chat.id, '✅ Проверка завершена!');
+        }
     } catch (error) {
         console.error('Ошибка при проверке новых сообщений:', error);
         await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при проверке новых сообщений.');
+    } finally {
+        isChecking = false;
     }
 });
 
@@ -1127,32 +1211,31 @@ bot.command('set_interval', async (ctx) => {
     }
 });
 
-// Команда для просмотра статуса
-bot.command('status', async (ctx) => {
+// Команда для просмотра статистики мониторинга
+bot.command('stats', async (ctx) => {
     try {
-        const status = isMonitoringActive ? '✅ Активен' : '🛑 Остановлен';
+        let message = '📊 Статистика мониторинга:\n';
+        message += `✓ Всего проверок: ${monitoringStats.totalChecks}\n`;
+        message += `📥 Обработано сообщений: ${monitoringStats.messagesProcessed}\n`;
+        message += `🔍 Найдено совпадений: ${monitoringStats.matchesFound}\n`;
 
-        let message = `📊 Статус мониторинга: ${status}\n`;
+        if (monitoringStats.lastCheck) {
+            // Форматируем дату и время последней проверки
+            const lastCheck = monitoringStats.lastCheck;
+            const formattedDate = `${lastCheck.getDate().toString().padStart(2, '0')}.${(lastCheck.getMonth() + 1).toString().padStart(2, '0')}.${lastCheck.getFullYear()} ${lastCheck.getHours().toString().padStart(2, '0')}:${lastCheck.getMinutes().toString().padStart(2, '0')}`;
+            message += `🕒 Последняя проверка: ${formattedDate}\n`;
+        }
+
+        message += `📡 Статус мониторинга: ${isMonitoringActive ? '✅ Активен' : '🛑 Остановлен'}\n`;
         message += `⏱️ Интервал проверки: ${config.checkInterval} минут\n`;
         message += `👁️ Групп в мониторинге: ${config.monitoredGroups.length}\n`;
-        message += `🔍 Ключевых слов: ${config.keywords.length}\n`;
+        message += `🔤 Ключевых слов: ${config.keywords.length}\n`;
         message += `💬 Ключевых слов для комментариев: ${config.commentKeywords.length}`;
 
-        // Создаем инлайн-клавиатуру с кнопками управления
-        const inlineKeyboard = isMonitoringActive
-            ? Markup.inlineKeyboard([
-                Markup.button.callback('⏹️ Остановить мониторинг', 'stop_monitoring'),
-                Markup.button.callback('🔄 Проверить сейчас', 'check_now')
-            ])
-            : Markup.inlineKeyboard([
-                Markup.button.callback('▶️ Запустить мониторинг', 'start_monitoring'),
-                Markup.button.callback('🔄 Проверить сейчас', 'check_now')
-            ]);
-
-        await safeSendMessage(ctx.chat.id, message, inlineKeyboard);
+        await safeSendMessage(ctx.chat.id, message);
     } catch (error) {
-        console.error('Ошибка при отображении статуса:', error);
-        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении статуса.');
+        console.error('Ошибка при отображении статистики:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении статистики.');
     }
 });
 
@@ -1372,7 +1455,7 @@ bot.hears('⏹️ Остановить мониторинг', async (ctx) => {
     }
 });
 
-// Обработчик команды "Проверить сейчас"
+// Модифицируем обработчик для кнопки "Проверить сейчас"
 bot.hears('🔄 Проверить сейчас', async (ctx) => {
     try {
         ctx.replyWithChatAction('typing');
@@ -1382,25 +1465,73 @@ bot.hears('🔄 Проверить сейчас', async (ctx) => {
             return;
         }
 
-        await safeSendMessage(ctx.chat.id, '🔄 Запускаю проверку новых сообщений в фоновом режиме...');
+        // Проверяем статус мониторинга
+        let startMessage = '🔄 Запускаю проверку новых сообщений...';
+        if (!isMonitoringActive) {
+            startMessage += '\n⚠️ Внимание: регулярный мониторинг отключен. Это разовая проверка.';
+        }
 
-        // Запускаем проверку, не дожидаясь ее завершения
-        setTimeout(async () => {
-            isChecking = true;
-            try {
-                await checkNewMessages().catch(console.error);
-                await safeSendMessage(ctx.chat.id, '✅ Проверка завершена!');
-            } catch (error) {
-                console.error('Ошибка при проверке сообщений:', error);
-                await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при проверке сообщений.');
-            } finally {
-                isChecking = false;
+        await safeSendMessage(ctx.chat.id, startMessage);
+
+        // Запускаем проверку
+        isChecking = true;
+
+        // Временно включаем мониторинг, если он отключен
+        const wasMonitoringActive = isMonitoringActive;
+        if (!wasMonitoringActive) {
+            isMonitoringActive = true;
+        }
+
+        // Выполняем проверку
+        const result = await checkNewMessages().catch(console.error);
+
+        // Возвращаем исходное состояние
+        if (!wasMonitoringActive) {
+            isMonitoringActive = false;
+        }
+
+        // Формируем сообщение с результатами
+        if (result) {
+            // Правильное склонение слов
+            let msgForm = 'сообщений';
+            if (result.totalProcessed % 10 === 1 && result.totalProcessed % 100 !== 11) {
+                msgForm = 'сообщение';
+            } else if ([2, 3, 4].includes(result.totalProcessed % 10) &&
+                ![12, 13, 14].includes(result.totalProcessed % 100)) {
+                msgForm = 'сообщения';
             }
-        }, 100);
 
+            let matchForm = 'совпадений';
+            if (result.matchesFound % 10 === 1 && result.matchesFound % 100 !== 11) {
+                matchForm = 'совпадение';
+            } else if ([2, 3, 4].includes(result.matchesFound % 10) &&
+                ![12, 13, 14].includes(result.matchesFound % 100)) {
+                matchForm = 'совпадения';
+            }
+
+            let message = `✅ Проверка завершена!\n📊 Обработано ${result.totalProcessed} ${msgForm}, найдено ${result.matchesFound} ${matchForm}.`;
+
+            // Добавляем напоминание о мониторинге, если он отключен
+            if (!wasMonitoringActive) {
+                message += '\n⚠️ Напоминание: регулярный мониторинг отключен.';
+            }
+
+            await safeSendMessage(ctx.chat.id, message);
+        } else {
+            let message = '✅ Проверка завершена!';
+
+            // Добавляем напоминание о мониторинге, если он отключен
+            if (!wasMonitoringActive) {
+                message += '\n⚠️ Напоминание: регулярный мониторинг отключен.';
+            }
+
+            await safeSendMessage(ctx.chat.id, message);
+        }
     } catch (error) {
-        console.error('Ошибка при запуске проверки сообщений:', error);
-        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при запуске проверки сообщений.');
+        console.error('Ошибка при проверке сообщений:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при проверке сообщений.');
+    } finally {
+        isChecking = false;
     }
 });
 // Обработка кнопок для работы с группами
@@ -1433,16 +1564,21 @@ bot.hears('📋 Список групп', async (ctx) => {
 
 bot.hears('➕ Добавить группу', async (ctx) => {
     try {
-        ctx.replyWithChatAction('typing');
+        // Сохраняем состояние пользователя - ожидаем ввод ссылки на группу
+        setUserState(ctx.from.id, { waitingForGroup: true });
+
         await safeSendMessage(
             ctx.chat.id,
-            '➕ Чтобы добавить группу, отправьте команду в формате:\n' +
-            '/add_group @channel_name\n' +
-            'или\n' +
-            '/add_group https://t.me/channel_name'
+            '➕ Введите ссылку на группу или канал для добавления в мониторинг.\n' +
+            'Поддерживаемые форматы:\n' +
+            '- @channel_name\n' +
+            '- https://t.me/channel_name\n' +
+            '- https://t.me/+abcdefghijkl (приватная ссылка)\n' +
+            '- ID канала (если вы его знаете)'
         );
     } catch (error) {
-        console.error('Ошибка при отображении информации о добавлении группы:', error);
+        console.error('Ошибка при запросе группы для добавления:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при запросе группы для добавления.');
     }
 });
 
@@ -1466,6 +1602,19 @@ bot.hears('➖ Удалить группу', async (ctx) => {
     } catch (error) {
         console.error('Ошибка при отображении списка групп для удаления:', error);
         await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при отображении списка групп для удаления.');
+    }
+});
+
+bot.hears('🆔 Получить ID канала', async (ctx) => {
+    try {
+        setUserState(ctx.from.id, { waitingForChannelLink: true });
+        await safeSendMessage(
+            ctx.chat.id,
+            '🆔 Введите ссылку на канал для получения ID.\n' +
+            'Обратите внимание: для приватного канала вы должны быть его участником.'
+        );
+    } catch (error) {
+        console.error('Ошибка при запросе ссылки для получения ID канала:', error);
     }
 });
 
@@ -1592,6 +1741,22 @@ bot.hears('📝 Список ключевых слов комментариев'
     }
 });
 
+bot.hears('🔄 Сбросить счетчики', async (ctx) => {
+    try {
+        await safeSendMessage(
+            ctx.chat.id,
+            '⚠️ Вы действительно хотите сбросить счетчики последних сообщений?\n' +
+            'При следующей проверке будут просканированы все сообщения.',
+            Markup.inlineKeyboard([
+                Markup.button.callback('✅ Да, сбросить', 'reset_counters_confirm'),
+                Markup.button.callback('❌ Отмена', 'reset_counters_cancel')
+            ])
+        );
+    } catch (error) {
+        console.error('Ошибка при запросе подтверждения сброса счетчиков:', error);
+    }
+});
+
 bot.hears('➕ Добавить ключевое слово комментариев', async (ctx) => {
     try {
         ctx.replyWithChatAction('typing');
@@ -1628,6 +1793,29 @@ bot.hears('➖ Удалить ключевое слово комментарие
     }
 });
 
+// Обработчик для кнопки "Получить ID канала"
+bot.hears('🆔 Получить ID канала', async (ctx) => {
+    try {
+        // Сохраняем состояние пользователя - ожидаем ввод ссылки на канал
+        setUserState(ctx.from.id, { waitingForChannelLink: true });
+
+        await safeSendMessage(
+            ctx.chat.id,
+            '🆔 Введите ссылку на канал для получения ID.\n' +
+            'Примеры формата:\n' +
+            '- @channel_name\n' +
+            '- https://t.me/channel_name\n' +
+            '- https://t.me/+abcdefghijkl (приватная ссылка)\n\n' +
+            'Обратите внимание: для приватного канала вы должны быть его участником.'
+        );
+    } catch (error) {
+        console.error('Ошибка при запросе ссылки для получения ID канала:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при запросе ссылки для получения ID канала.');
+    }
+});
+
+
+
 // Обработка нажатий на инлайн-кнопки
 bot.action('start_monitoring', async (ctx) => {
     try {
@@ -1642,6 +1830,27 @@ bot.action('start_monitoring', async (ctx) => {
     } catch (error) {
         console.error('Ошибка при запуске мониторинга через инлайн-кнопку:', error);
         await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при запуске мониторинга.');
+    }
+});
+
+// Обработчики для подтверждения сброса счетчиков
+bot.action('reset_counters_confirm', async (ctx) => {
+    try {
+        await ctx.answerCbQuery('Сбрасываю счетчики...');
+        await resetLastMessageIds();
+        await ctx.editMessageText('✅ Счетчики последних сообщений успешно сброшены. При следующей проверке будут просканированы все сообщения.');
+    } catch (error) {
+        console.error('Ошибка при сбросе счетчиков:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при сбросе счетчиков.');
+    }
+});
+
+bot.action('reset_counters_cancel', async (ctx) => {
+    try {
+        await ctx.answerCbQuery('Операция отменена');
+        await ctx.editMessageText('❌ Сброс счетчиков отменен.');
+    } catch (error) {
+        console.error('Ошибка при отмене сброса счетчиков:', error);
     }
 });
 
@@ -1684,7 +1893,6 @@ bot.action('stop_monitoring', async (ctx) => {
         await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при остановке мониторинга.');
     }
 });
-
 // Обработка инлайн-кнопки "Проверить сейчас"
 bot.action('check_now', async (ctx) => {
     try {
@@ -1696,15 +1904,81 @@ bot.action('check_now', async (ctx) => {
             return;
         }
 
-        await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n🔄 Запускаю проверку новых сообщений...');
+        // Отображаем статус мониторинга
+        const monitoringStatus = isMonitoringActive ?
+            '✅ Мониторинг активен.' :
+            '⚠️ Мониторинг отключен! Выполняется разовая проверка.';
 
-        // Запускаем проверку в отдельном процессе
-        runCheckProcess();
+        await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n🔄 Запускаю проверку новых сообщений...\n' + monitoringStatus);
 
-        // Отправляем уведомление о запуске проверки
+        // Запускаем проверку
         setTimeout(async () => {
-            await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n✅ Проверка запущена в фоновом режиме. Результаты будут отправлены в чат.');
-        }, 2000);
+            isChecking = true;
+            try {
+                // Временно включаем мониторинг для проверки
+                const wasMonitoringActive = isMonitoringActive;
+                if (!wasMonitoringActive) {
+                    isMonitoringActive = true;
+                }
+
+                // Выполняем проверку
+                const result = await checkNewMessages().catch(console.error);
+
+                // Возвращаем статус мониторинга
+                if (!wasMonitoringActive) {
+                    isMonitoringActive = false;
+                }
+
+                // Формируем сообщение с результатами
+                let resultMessage = '✅ Проверка завершена!';
+
+                if (result) {
+                    if (result.totalProcessed === 0) {
+                        resultMessage += '\n📭 Новых сообщений не обнаружено.';
+                    } else {
+                        // Корректное склонение слова "сообщений"
+                        let msgForm = 'сообщений';
+                        if (result.totalProcessed % 10 === 1 && result.totalProcessed % 100 !== 11) {
+                            msgForm = 'сообщение';
+                        } else if ([2, 3, 4].includes(result.totalProcessed % 10) &&
+                            ![12, 13, 14].includes(result.totalProcessed % 100)) {
+                            msgForm = 'сообщения';
+                        }
+
+                        resultMessage += `\n📊 Обработано ${result.totalProcessed} ${msgForm}, `;
+
+                        if (result.matchesFound > 0) {
+                            // Корректное склонение слова "совпадений"
+                            let matchForm = 'совпадений';
+                            if (result.matchesFound % 10 === 1 && result.matchesFound % 100 !== 11) {
+                                matchForm = 'совпадение';
+                            } else if ([2, 3, 4].includes(result.matchesFound % 10) &&
+                                ![12, 13, 14].includes(result.matchesFound % 100)) {
+                                matchForm = 'совпадения';
+                            }
+
+                            resultMessage += `найдено ${result.matchesFound} ${matchForm}.`;
+                        } else {
+                            resultMessage += 'совпадений не найдено.';
+                        }
+                    }
+                }
+
+                // Добавляем напоминание о статусе мониторинга
+                if (!wasMonitoringActive) {
+                    resultMessage += '\n\n⚠️ Напоминание: регулярный мониторинг отключен.';
+                }
+
+                // Обновляем сообщение с результатами
+                await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n' + resultMessage);
+
+            } catch (error) {
+                console.error('Ошибка при выполнении проверки:', error);
+                await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n❌ Произошла ошибка при выполнении проверки.');
+            } finally {
+                isChecking = false;
+            }
+        }, 100);
 
     } catch (error) {
         console.error('Ошибка при запуске проверки через инлайн-кнопку:', error);
@@ -1714,12 +1988,22 @@ bot.action('check_now', async (ctx) => {
 // Добавление группы через инлайн кнопку
 bot.action('add_group_dialog', async (ctx) => {
     try {
-        await ctx.answerCbQuery();
-        // Сохраняем состояние пользователя
+        await ctx.answerCbQuery('Добавление новой группы');
+
+        // Сохраняем состояние пользователя - явно указываем режим ожидания ввода группы
         setUserState(ctx.from.id, { waitingForGroup: true });
-        await safeSendMessage(ctx.chat.id, 'Отправьте ссылку на группу или канал (например, @channel_name или https://t.me/channel_name):');
+
+        await safeSendMessage(
+            ctx.chat.id,
+            '➕ Введите ссылку или ID группы/канала для добавления в мониторинг.\n' +
+            'Поддерживаемые форматы:\n' +
+            '- @channel_name\n' +
+            '- https://t.me/channel_name\n' +
+            '- ID в формате -100xxxxxxxxxx'
+        );
     } catch (error) {
         console.error('Ошибка при открытии диалога добавления группы:', error);
+        await safeSendMessage(ctx.chat.id, '❌ Произошла ошибка при открытии диалога добавления группы.');
     }
 });
 
@@ -1914,27 +2198,68 @@ bot.action(commentKeywordRemovePattern, async (ctx) => {
 });
 
 // Обработка текстовых сообщений для добавления групп и ключевых слов
+// Обработка текстовых сообщений для добавления групп и ключевых слов
 bot.on('text', async (ctx) => {
     try {
         // Получаем текущее состояние пользователя
         const state = getUserState(ctx.from.id);
 
+        // Проверяем, находимся ли мы в режиме ожидания ввода ссылки на канал для получения ID
+        if (state.waitingForChannelLink) {
+            const channelLink = ctx.message.text.trim();
+
+            try {
+                const channelId = await getChannelIdIfMember(channelLink);
+                await safeSendMessage(
+                    ctx.chat.id,
+                    `🆔 ID канала: ${channelId}\n\nВы можете использовать этот ID для добавления в мониторинг: /add_group ${channelId}`
+                );
+            } catch (error) {
+                console.error('Ошибка при получении ID канала:', error);
+                await safeSendMessage(
+                    ctx.chat.id,
+                    `❌ Ошибка при получении ID канала: ${error.message}\n\nУбедитесь, что вы являетесь участником приватного канала.`
+                );
+            }
+
+            // Сбрасываем состояние ожидания
+            setUserState(ctx.from.id, {});
+            return;
+        }
+
         // Проверяем, находимся ли мы в режиме ожидания ввода группы
         if (state.waitingForGroup) {
+            // Получаем введенный пользователем текст без лишних пробелов
             const newGroup = ctx.message.text.trim();
 
-            if (!config.monitoredGroups.includes(newGroup)) {
-                config.monitoredGroups.push(newGroup);
-                // Создаем запись для отслеживания последнего сообщения
-                await LastMessage.findOneAndUpdate(
-                    { groupId: newGroup },
-                    { lastMessageId: 0 },
-                    { upsert: true }
-                );
-                await saveConfig();
-                await safeSendMessage(ctx.chat.id, `✅ Группа ${newGroup} добавлена в список мониторинга.`);
-            } else {
-                await safeSendMessage(ctx.chat.id, `⚠️ Группа ${newGroup} уже есть в списке мониторинга.`);
+            try {
+                // Проверяем, не является ли введенное значение ID канала (начинается с -100)
+                let groupToAdd = newGroup;
+
+                // Проверка наличия группы в списке мониторинга
+                if (!config.monitoredGroups.includes(groupToAdd)) {
+                    // Добавляем группу в список мониторинга
+                    config.monitoredGroups.push(groupToAdd);
+
+                    // Создаем запись для отслеживания последнего сообщения
+                    await LastMessage.findOneAndUpdate(
+                        { groupId: groupToAdd },
+                        { lastMessageId: 0 },
+                        { upsert: true }
+                    );
+
+                    // Сохраняем конфигурацию
+                    await saveConfig();
+
+                    // Отправляем подтверждение
+                    await safeSendMessage(ctx.chat.id, `✅ Группа ${groupToAdd} добавлена в список мониторинга.`);
+                } else {
+                    // Сообщаем, что группа уже в списке
+                    await safeSendMessage(ctx.chat.id, `⚠️ Группа ${groupToAdd} уже есть в списке мониторинга.`);
+                }
+            } catch (error) {
+                console.error('Ошибка при добавлении группы:', error);
+                await safeSendMessage(ctx.chat.id, `❌ Произошла ошибка при добавлении группы: ${error.message}`);
             }
 
             // Сбрасываем состояние ожидания
